@@ -174,6 +174,9 @@ var DICE = (function() {
         try { box.clear(); } catch (e) { /* ignore */ }
         box.rolling = false;
         _clearRollWatchdog(box);
+        if (typeof box._savedUat !== 'undefined') {
+            vars.use_adaptive_timestep = box._savedUat;
+        }
 
         var err = createDiceError(
             error.code || 'UNKNOWN_ERROR',
@@ -769,7 +772,8 @@ var DICE = (function() {
                             type: group.type,
                             value: rollLogicalValue(group.type),
                             kept: true,
-                            subResults: []
+                            subResults: [],
+                            _isPenetratingFollowUp: !!group._isPenetratingFollowUp
                         });
                     }
                 }
@@ -797,6 +801,8 @@ var DICE = (function() {
                     for (var ri = 0; ri < groupDef.rules.length; ri++) {
                         var rule = groupDef.rules[ri];
 
+                        if (rule.type === 'reroll' && rule.once && groupDef._rerolledOnce) continue;
+
                         if (rule.type === 'explode' || rule.type === 'explode-compounding') {
                             var maxFace = die_max_value(die.type);
                             var shouldExplode = (rule.threshold === 'max')
@@ -804,19 +810,25 @@ var DICE = (function() {
                                 : compareValues(die.value, rule.condition || 'greater-than', rule.threshold);
                             if (shouldExplode) {
                                 explodedDice.push(die);
-                                logEvent(audit, phase, 'explode',
-                                    'Die #' + die.diceId + ' (value ' + die.value + ') exploded.',
-                                    { diceId: die.diceId, value: die.value, rule: rule.type });
+                                logEvent(audit, phase, 'explode', 'Die #' + die.diceId + ' (value ' + die.value + ') exploded.', { diceId: die.diceId, value: die.value, rule: rule.type });
                             }
                         }
 
                         if (rule.type === 'reroll') {
                             if (compareValues(die.value, rule.condition || 'less-than', rule.threshold)) {
                                 die.kept = false;
+                                if (rule.once) die._triggeredOnce = true;
                                 rerolledDice.push(die);
-                                logEvent(audit, phase, 'reroll',
-                                    'Die #' + die.diceId + ' (value ' + die.value + ') will be rerolled.',
-                                    { diceId: die.diceId, value: die.value, rule: rule.type });
+                                logEvent(audit, phase, 'reroll', 'Die #' + die.diceId + ' (value ' + die.value + ') will be rerolled.', { diceId: die.diceId, value: die.value, rule: rule.type });
+                            }
+                        }
+
+                        if (rule.type === 'penetrate') {
+                            var penMax = die_max_value(die.type);
+                            if (die.value >= penMax) {
+                                die._triggeredPenetrate = true;
+                                explodedDice.push(die);
+                                logEvent(audit, phase, 'penetrate', 'Die #' + die.diceId + ' (value ' + die.value + ') penetrated.', { diceId: die.diceId, value: die.value });
                             }
                         }
                     }
@@ -846,6 +858,8 @@ var DICE = (function() {
             var targetThreshold = notation._targetThreshold;
             var failureThreshold = notation._failureThreshold;
             var finalValue;
+            var penetratingReduction = 0;
+            var isCountMode = (targetThreshold !== undefined) || (failureThreshold !== undefined);
 
             if (targetThreshold !== undefined) {
                 var targetOp = notation._targetCondition || 'greater-equal';
@@ -861,18 +875,29 @@ var DICE = (function() {
                 }
             } else {
                 finalValue = notation.constant || 0;
-                for (var i = 0; i < keptAccum.length; i++) finalValue += keptAccum[i].value;
+                for (var i = 0; i < keptAccum.length; i++) {
+                    var contrib = keptAccum[i].value;
+                    if (keptAccum[i]._isPenetratingFollowUp) {
+                        var adjusted = Math.max(0, contrib - 1);
+                        penetratingReduction += (contrib - adjusted);
+                        contrib = adjusted;
+                    }
+                    finalValue += contrib;
+                }
             }
 
             keptAccum = sortKeptDice(keptAccum, notation);
 
             var values = keptAccum.map(function(d) { return d.value; });
             var resultString = values.join(' ');
-            if (notation.constant) {
+            if (penetratingReduction > 0) {
+                resultString += ' (penetrating: -' + penetratingReduction + ')';
+            }
+            if (!isCountMode && notation.constant) {
                 if (notation.constant > 0) resultString += ' +' + notation.constant;
                 else resultString += ' -' + Math.abs(notation.constant);
             }
-            if (values.length > 1 || notation.constant) {
+            if (values.length > 1 || (!isCountMode && notation.constant) || penetratingReduction > 0) {
                 resultString += ' = ' + finalValue;
             }
 
@@ -881,7 +906,7 @@ var DICE = (function() {
                 set: notation.set,
                 constant: notation.constant || 0,
                 result: keptAccum.map(function(d) { return d.value; }),
-                diceResults: keptAccum,
+                diceResults: allDiceAccum,
                 resultTotal: finalValue,
                 resultString: resultString,
                 audit: audit,
@@ -2183,15 +2208,29 @@ var DICE = (function() {
      *          to finalise the roll.
      */
     function build_next_notation(explodedDice, rerolledDice, originalNotation) {
-        var allDice = explodedDice.concat(rerolledDice);
+        // Dedupe — a die can appear in both arrays if it satisfies multiple rules
+        var seen = {};
+        var allDice = [];
+        var src = explodedDice.concat(rerolledDice);
+        for (var i = 0; i < src.length; i++) {
+            if (!seen[src[i].diceId]) {
+                seen[src[i].diceId] = true;
+                allDice.push(src[i]);
+            }
+        }
         if (allDice.length === 0) return null;
 
         var groupsMap = {};
         for (var i = 0; i < allDice.length; i++) {
             var die = allDice[i];
             var gid = die.groupId;
-            if (!groupsMap[gid]) {
-                // Find the original group definition
+            // Split by once-state and penetrate-state so each phase evaluates
+            // the correct rules for its dice.
+            var mapKey = gid
+                + (die._triggeredOnce ? '_once' : '')
+                + (die._triggeredPenetrate ? '_pen' : '');
+
+            if (!groupsMap[mapKey]) {
                 var origGroup = null;
                 for (var j = 0; j < originalNotation.groups.length; j++) {
                     if (originalNotation.groups[j].id === gid) {
@@ -2200,29 +2239,32 @@ var DICE = (function() {
                     }
                 }
                 if (!origGroup) continue;
-                // Determine the original group ID for colour inheritance
-                var originalId = origGroup.originalGroupId !== undefined ? origGroup.originalGroupId : origGroup.id;
-                groupsMap[gid] = {
+                var originalId = origGroup.originalGroupId !== undefined
+                    ? origGroup.originalGroupId : origGroup.id;
+
+                groupsMap[mapKey] = {
                     id: Object.keys(groupsMap).length,
                     count: 0,
                     type: origGroup.type,
                     rules: origGroup.rules.slice(),
                     isCompound: origGroup.isCompound,
                     visual: origGroup.visual ? JSON.parse(JSON.stringify(origGroup.visual)) : null,
-                    originalGroupId: originalId   // propagate original ID
+                    originalGroupId: originalId,
+                    _rerolledOnce: !!die._triggeredOnce,
+                    _isPenetratingFollowUp: !!die._triggeredPenetrate
                 };
             }
-            groupsMap[gid].count++;
+            groupsMap[mapKey].count++;
         }
 
         var newGroups = Object.values(groupsMap);
         return {
             groups: newGroups,
-            set: [], // will be filled later by generate_vectors
-            constant: 0,
+            set: [],
+            constant: 0,          // unchanged — see fix #2 for how constants are handled
             error: false,
         };
-    }
+}
 
     /**
      * Finds a group definition within a parsed notation by its numeric id.
@@ -2620,6 +2662,12 @@ var DICE = (function() {
             try{
                 // Combine compound dice
                 var combined = combine_compound_results(rawResults, box.dices);
+                for (var ci = 0; ci < combined.length; ci++) {
+                    var cgd = findGroupById(parsedNotation, combined[ci].groupId);
+                    if (cgd && cgd._isPenetratingFollowUp) {
+                        combined[ci]._isPenetratingFollowUp = true;
+                    }
+                }
 
                 // Log roll event
                 var vals = combined.map(d => d.value).join(', ');
@@ -2640,7 +2688,12 @@ var DICE = (function() {
                     var die = combined[i];
                     if (!die.kept) continue;
 
-                    phaseTotal += die.value;
+                    // Contribution accounts for penetrating follow-ups
+                    var contrib = die.value;
+                    if (die._isPenetratingFollowUp) {
+                        contrib = Math.max(0, contrib - 1);
+                    }
+                    phaseTotal += contrib;
 
                     var groupDef = findGroupById(parsedNotation, die.groupId);
                     if (!groupDef) continue;
@@ -2648,47 +2701,33 @@ var DICE = (function() {
                     for (var ri = 0; ri < groupDef.rules.length; ri++) {
                         var rule = groupDef.rules[ri];
 
-                        // Explosion
-                        if (rule.type === 'explode' || rule.type === 'explode-compounding') {
-                            var maxVal = die_max_value(die.type);
-                            var explodeCondition = false;
-                            if (rule.threshold === 'max') {
-                                if (die.value === maxVal) explodeCondition = true;
-                            } else {
-                                var explodeOp = rule.condition || 'greater-than';
-                                if (compareValues(die.value, explodeOp, rule.threshold)) explodeCondition = true;
-                            }
-                            if (explodeCondition) {
-                                explodedDice.push(die);
-                                var mesh = box.dices.find(d => d.dice_id === die.diceId);
-                                if (mesh) apply_explosion_highlight(mesh);
-                                logEvent(audit, depth, 'explode', 'Die #' + die.diceId + ' (value ' + die.value + ') exploded.', { diceId: die.diceId, value: die.value, rule: rule.type });
-                            }
-                        }
+                        // Once-rerolls are consumed for follow-ups from a previous once-reroll
+                        if (rule.type === 'reroll' && rule.once && groupDef._rerolledOnce) continue;
 
-                        // Reroll
+                        // ... existing explode / explode-compounding / reroll / penetrate blocks ...
+
+                        // In the reroll block, tag the die so build_next_notation can split it:
                         if (rule.type === 'reroll') {
                             var rerollOp = rule.condition || 'less-than';
                             if (compareValues(die.value, rerollOp, rule.threshold)) {
                                 die.kept = false;
-                                phaseTotal -= die.value;
+                                phaseTotal -= contrib;
+                                if (rule.once) die._triggeredOnce = true;
                                 rerolledDice.push(die);
                                 logEvent(audit, depth, 'reroll', 'Die #' + die.diceId + ' (value ' + die.value + ') will be rerolled.', { diceId: die.diceId, value: die.value, rule: rule.type });
                             }
                         }
 
-                        // Penetrate
+                        // In the penetrate block, use die_max_value and tag the die:
                         if (rule.type === 'penetrate') {
-                            if (die.value >= 10) {
+                            var penMax = die_max_value(die.type);
+                            if (die.value >= penMax) {
                                 die._penetrate = true;
+                                die._triggeredPenetrate = true;
                                 explodedDice.push(die);
                                 logEvent(audit, depth, 'penetrate', 'Die #' + die.diceId + ' (value ' + die.value + ') penetrated.', { diceId: die.diceId, value: die.value });
                             }
                         }
-                    }
-
-                    if (explodedDice.length > 0) {
-                        box.renderer.render(box.scene, box.camera);
                     }
                 }
 
@@ -2702,7 +2741,7 @@ var DICE = (function() {
 
                 if (!nextNotation || nextNotation.groups.length === 0) {
                     // No more dice – finalise
-                    _finalise_roll(box, parsedNotation, accumulatedTotal + phaseTotal, finalCallback, keptAccum, audit);
+                    _finalise_roll(box, parsedNotation, accumulatedTotal + phaseTotal, finalCallback, keptAccum, allDiceAccum, audit);
                 } else {
                     // Recurse without clearing first — _roll_phase calls
                     // prepare_dices_for_roll, which clears on entry. Clearing here
@@ -2814,50 +2853,64 @@ var DICE = (function() {
      * @returns {void}
      */
     function _finalise_roll(box, lastNotation, finalTotal, afterRollCb, keptAccum, allDiceAccum, audit) {
-        // Determine result type based on rules
-        var targetThreshold = lastNotation._targetThreshold;
-        var failureThreshold = lastNotation._failureThreshold;
+        // Fall back to the original notation so constant/groups survive recursion
+        var original = box._originalNotation || lastNotation;
 
-        var finalValue = finalTotal;
-        var successCount = 0;
-        var failureCount = 0;
+        var constVal          = original.constant || 0;
+        var targetThreshold   = original._targetThreshold;
+        var failureThreshold  = original._failureThreshold;
+        var isCountMode       = (targetThreshold !== undefined) || (failureThreshold !== undefined);
+
+        var finalValue = 0;
+        var penetratingReduction = 0;
 
         if (targetThreshold !== undefined) {
-            var targetOp = lastNotation._targetCondition || 'greater-equal';
+            var targetOp = original._targetCondition || 'greater-equal';
             for (var i = 0; i < keptAccum.length; i++) {
-                if (compareValues(keptAccum[i].value, targetOp, targetThreshold)) successCount++;
+                if (compareValues(keptAccum[i].value, targetOp, targetThreshold)) finalValue++;
             }
-            finalValue = successCount;
         } else if (failureThreshold !== undefined) {
-            var failOp = lastNotation._failureCondition || 'less-than';
+            var failOp = original._failureCondition || 'less-than';
             for (var i = 0; i < keptAccum.length; i++) {
-                if (compareValues(keptAccum[i].value, failOp, failureThreshold)) failureCount++;
+                if (compareValues(keptAccum[i].value, failOp, failureThreshold)) finalValue++;
             }
-            finalValue = failureCount;
         } else {
-            // Sum of kept dice
-            // finalTotal already includes all kept dice from all phases
-            finalValue = finalTotal;
+            // Sum mode: recompute from keptAccum so the constant and penetrate
+            // reduction are applied consistently with the silent path.
+            finalValue = constVal;
+            for (var i = 0; i < keptAccum.length; i++) {
+                var contrib = keptAccum[i].value;
+                if (keptAccum[i]._isPenetratingFollowUp) {
+                    var adjusted = Math.max(0, contrib - 1);
+                    penetratingReduction += (contrib - adjusted);
+                    contrib = adjusted;
+                }
+                finalValue += contrib;
+            }
         }
 
-        // Build result string
-        if (box._originalNotation) {
-            keptAccum = sortKeptDice(keptAccum, box._originalNotation);
+        if (original) {
+            keptAccum = sortKeptDice(keptAccum, original);
         }
+
         var values = keptAccum.map(d => d.value);
         var resultString = values.join(' ');
-        if (lastNotation.constant) {
-            if (lastNotation.constant > 0) resultString += ' +' + lastNotation.constant;
-            else resultString += ' -' + Math.abs(lastNotation.constant);
+        if (penetratingReduction > 0) {
+            resultString += ' (penetrating: -' + penetratingReduction + ')';
         }
-        if (values.length > 1 || lastNotation.constant) {
+        // Constant is only meaningful in sum mode — suppress it in count mode.
+        if (!isCountMode && constVal) {
+            if (constVal > 0) resultString += ' +' + constVal;
+            else resultString += ' -' + Math.abs(constVal);
+        }
+        if (values.length > 1 || (!isCountMode && constVal) || penetratingReduction > 0) {
             resultString += ' = ' + finalValue;
         }
 
         var notation = {
-            groups: lastNotation.groups,
-            set: lastNotation.set,
-            constant: lastNotation.constant || 0,
+            groups: original.groups,
+            set: original.set,
+            constant: constVal,
             result: keptAccum.map(d => d.value),
             diceResults: allDiceAccum,
             resultTotal: finalValue,
@@ -2870,6 +2923,13 @@ var DICE = (function() {
 
         box.rolling = false;
         _clearRollWatchdog(box);
+
+        // Restore adaptive timestep that _roll_phase may have disabled for
+        // forced pre-shift simulation.
+        if (typeof box._savedUat !== 'undefined') {
+            vars.use_adaptive_timestep = box._savedUat;
+        }
+
         try {
             if (afterRollCb) afterRollCb(notation);
         } catch (e) {
@@ -2973,6 +3033,7 @@ var DICE = (function() {
 
         box.rolling = true;
         _setRollWatchdog(box, notation);
+        box._savedUat = uat;
 
         // Handle before_roll callback (only for first phase)
         var request_results = null;
@@ -2992,6 +3053,7 @@ var DICE = (function() {
             // Use recursive pipeline
             var audit = [];
             var keptAccum = [];
+            var allDiceAccum = [];
             var maxDepth = vars.max_recursion_depth;
             try{
                 // We'll call _process_recursive_roll with the initial notation
@@ -4639,6 +4701,7 @@ var DICE = (function() {
 
         for (var i = 0; i < combined.length; i++) {
             var die = combined[i];
+            if (!die.kept) continue; 
             if (!die.critical && !die.failure) continue;
             var isFailure = die.failure === true;
             var subs = die.subResults || [die];
