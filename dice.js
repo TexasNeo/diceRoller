@@ -743,6 +743,7 @@ var DICE = (function() {
 
             var audit = [];
             var keptAccum = [];
+            var allDiceAccum = [];
             var dieIdCounter = 0;
             var maxRecursion = vars.max_recursion_depth;
             var maxDice = vars.max_dice_per_roll;
@@ -822,6 +823,7 @@ var DICE = (function() {
                 }
 
                 for (var k = 0; k < combined.length; k++) {
+                    allDiceAccum.push(combined[k]); 
                     if (combined[k].kept) keptAccum.push(combined[k]);
                 }
 
@@ -2579,7 +2581,8 @@ var DICE = (function() {
         forcedResults,
         finalCallback,
         audit,
-        keptAccum
+        keptAccum,
+        allDiceAccum
     ) {
         if (depth > maxDepth) {
             var err = createDiceError('RECURSION_DEPTH_EXCEEDED', 'Max recursion depth reached (' + maxDepth + ').');
@@ -2692,6 +2695,7 @@ var DICE = (function() {
                 // Accumulate kept dice
                 var keptThisPhase = combined.filter(d => d.kept);
                 keptAccum.push.apply(keptAccum, keptThisPhase);
+                allDiceAccum.push.apply(allDiceAccum, combined);
 
                 // Build next notation
                 var nextNotation = build_next_notation(explodedDice, rerolledDice, parsedNotation);
@@ -2727,7 +2731,8 @@ var DICE = (function() {
                                     null,               // no forced results for subsequent phases
                                     finalCallback,
                                     audit,
-                                    keptAccum
+                                    keptAccum,
+                                    allDiceAccum 
                                 );
                             }, delay);
                         } else {
@@ -2742,7 +2747,8 @@ var DICE = (function() {
                                     null,               // no forced results for subsequent phases
                                     finalCallback,
                                     audit,
-                                    keptAccum
+                                    keptAccum,
+                                    allDiceAccum
                                 );
                         }
                     } catch(e) {
@@ -2801,10 +2807,13 @@ var DICE = (function() {
      * @param {Array} keptAccum - All kept logical dice accumulated across
      *        every phase. Re-ordered in place before being attached to the
      *        result.
+     * @param {Array} allDiceAccum - All logical dice accumulated across
+     *        every phase. Re-ordered in place before being attached to the
+     *        result.
      * @param {Array} audit - The shared audit trail.
      * @returns {void}
      */
-    function _finalise_roll(box, lastNotation, finalTotal, afterRollCb, keptAccum, audit) {
+    function _finalise_roll(box, lastNotation, finalTotal, afterRollCb, keptAccum, allDiceAccum, audit) {
         // Determine result type based on rules
         var targetThreshold = lastNotation._targetThreshold;
         var failureThreshold = lastNotation._failureThreshold;
@@ -2850,7 +2859,7 @@ var DICE = (function() {
             set: lastNotation.set,
             constant: lastNotation.constant || 0,
             result: keptAccum.map(d => d.value),
-            diceResults: keptAccum,
+            diceResults: allDiceAccum,
             resultTotal: finalValue,
             resultString: resultString,
             audit: audit,
@@ -2997,7 +3006,8 @@ var DICE = (function() {
                     request_results, // pass forced results for first phase
                     after_roll,
                     audit,
-                    keptAccum
+                    keptAccum,
+                    allDiceAccum
                 );
             } catch (e) {
                 var err = createDiceError('VECTOR_GENERATION_FAILED', null, e);
