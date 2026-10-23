@@ -420,7 +420,7 @@ var DICE = (function() {
         spot_light_intensity: 2.0,
 
         // settings for advanced rules
-        max_recursion_depth: 50,        // prevent infinite loops
+        max_recursion_depth: 10,        // prevent infinite loops
         max_dice_per_roll: 100,         // safety cap for total dice
         explosion_delay_ms: 300,        // delay before exploding dice are rolled
 
@@ -3824,7 +3824,7 @@ var DICE = (function() {
             clearTimeout(this._clearTimeout);
             this._clearTimeout = null;
         }
-        
+
         if (this._resizeObserver) this._resizeObserver.disconnect();
         if (this._fadeTimeout) clearTimeout(this._fadeTimeout);
         if (this._fadeRafId) cancelAnimationFrame(this._fadeRafId);

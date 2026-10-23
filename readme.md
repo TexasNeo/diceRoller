@@ -907,10 +907,10 @@ A die that "explodes" is rolled again, and the new result is added to the total.
 |`2d6!`|	Explode on a 6 (max face)|
 |`4d6!>4`|	Explode on a value greater than 4|
 |`4d6!>=5`|	Same as above, expressed as >=|
-|`4d6!5`|	Explode on 5 or higher (shorthand for !>=5)|
-|`2d6!!`|	Compounding explosion — the original die's value is retained and the exploded die |is added; the die stays in place and the new value is appended|
-|`2d6!!>4`|	Compounding explosion with a threshold|
-|`1d10p`|	Penetrating explode (World of Darkness style) — explode on 10, and each subsequent die rolls with a −1 modifier|
+|`4d6!5`|	Explode on 5 or higher|
+|`2d6!!`|	Compounding explosion — This is treated exactly the same as regular explosions, for now|
+|`2d6!!>4`|	Compounding explosion with a threshold, This is treated exactly the same as regular explosions, for now|
+|`1d10p`|	Penetrating explosion (World of Darkness style). On a 10 the die penetrates: it keeps its value and spawns a follow-up die. Each follow-up rolls normally but contributes value − 1 to the total. Follow-ups that also show 10 penetrate again.|
 |`2d6er`|	Explode on max, and reroll any 1s that appear (see Rerolls)|
 
 ### Rerolls
@@ -919,7 +919,6 @@ A rerolled die is discarded and physically rerolled. Rerolled dice are greyed ou
 | Notation | Meaning |
 |---       |---      |
 |`1d20r1`|	Reroll 1s until they stop appearing|
-|`4d6r1r2`|	Reroll 1s and 2s until neither appears|
 |`1d20r>18`|	Reroll anything over 18|
 |`1d20ro1`|	Reroll 1s once (if the new value is also a 1, keep it)|
 |`1d20ro<5`|	Reroll anything under 5, once|
@@ -955,14 +954,16 @@ Change the meaning of the final result from "sum of all kept dice" to "count of 
 |---       |---      |
 |`6d10t7`|	Roll 6d10, count how many are 7 or higher|
 |`6d10t>6`|	Same|
-|`6d10f3`|	Count how many are under 3|
-|`6d10f<=2`|	Same|
+|`6d10f3`|	Count how many are 3 or under|
+|`6d10f<=3`|	Same|
 
 Dice meeting the condition are marked `success: true` (for `t`) or
 `failure: true` (for `f`) on their entry in `result.diceResults`,
 independent of whether the roll's numeric result is a success count
 or a failure count. This lets presentation layers highlight which
 individual dice contributed.
+
+Note: when both a target and failure rules are present on the same group, `resultTotal` reports the success count (target wins) but failure count still reports the failure count. A consumer reading only resultTotal will likely miss the failure information.
 
 ### Combining rules
 Rules chain in written order. This matters — `4d6kh3!` keeps the three highest, then explodes those kept dice. `4d6!kh3` explodes first, then keeps the three highest from the exploded pool.
@@ -1038,7 +1039,7 @@ box.roll({ angle: Math.PI / 4, minBoost: 3, maxBoost: 6 });
  If a roll is already in progress, the Promise rejects with an error of code `ROLL_IN_PROGRESS`.
 ___
  ### `box.start_throw([options], [before_roll], [after_roll])`
- Identical to roll() but does not randomise the vector if one isn't provided — it uses whatever the caller supplies, or falls back to a random vector. Mostly useful if you want to supply your own vector and boost rather than having roll() compute them.
+ Lower-level entry point. Same physics pipeline as roll() but accepts only vector and boost — it doesn't support angle, minBoost, or maxBoost. If either is omitted it falls back to a random value, same as roll().
  ```js
  box.start_throw({
     vector: { x: 100, y: -50 },
@@ -1049,13 +1050,13 @@ ___
  ```
  ___
 ### `box.bind_swipe(container, [before_roll], [after_roll])`
-Attaches swipe / drag gesture handlers to an element. The direction and speed of the swipe determine the throw. Returns a Promise from each roll if you want to capture results.
+Attaches swipe / drag gesture handlers to an element. The direction and speed of the swipe determine the throw. The internal roll is fire-and-forget; bind_swipe itself returns nothing. Use box.roll() directly if you need the result Promise.
 ```js
 box.bind_swipe(document.getElementById('tray'));
 ```
 ___
 ### `box.setOnExplosion(callback)`
-Registers a callback fired each time a phase contains exploding dice, before the next phase begins. Useful for triggering sound effects, screen shake, or custom visuals.
+Registers a callback fired each time a phase contains exploding or penetrating dice, before the next phase begins. Useful for triggering sound effects, screen shake, or custom visuals.
 ```js
 box.setOnExplosion(function(info) {
     console.log('Phase', info.phase, 'produced', info.explodedDice.length, 'explosions');
@@ -1159,6 +1160,13 @@ const auditText = DICE.formatAudit(result.audit);
 console.log(auditText);
 ```
 ___
+### `DICE.rollSilent(notation, before_roll?, after_roll?)`
+Performs a headless roll. This is the static equivalent of `box.roll({silent: true})` and takes no `dice_box`.
+```js
+const result = await DICE.rollSilent('4d6dl1');
+console.log(result.resultTotal);
+```
+___
 
 ## Configuration Reference
 Every parameter below can be read with box.getParam(), written with box.setParam(), or bulk-applied with `box.setConfig()`.
@@ -1168,7 +1176,7 @@ Every parameter below can be read with box.getParam(), written with box.setParam
 |----|----|----|----|----|
 |`gravity_x`|	number|	−10000-10000|	0	|X component of gravity|
 |`gravity_y`|	number|	−10000-10000|	0	|Y component of gravity
-|`gravity_z`|	number|	−10000-0|7840	|Z component (downward). Lower values pull dice faster
+|`gravity_z`|	number|	−10000-0|-7840	|Z component (downward). more negative values pull dice faster
 |`solver_iterations`|	integer|	1–100|	16|	Physics solver accuracy|
 |`dice_friction`|	number|	0–1	|0.01|	Friction between dice and desk|
 |`dice_restitution`|	number|	0–1|	0.5|	Bounciness between dice and desk|
@@ -1181,7 +1189,7 @@ Every parameter below can be read with box.getParam(), written with box.setParam
 ### Visuals
 |Parameter|Type|Range|Default|Description|
 |----|----|----|----|----|
-|`camera_distance`|	number|	10–5000|	auto|	Camera Z distance. null computes it|
+|`camera_distance`|	number|	10–5000|	null|	Camera Z distance. null computes it|
 |`camera_fov`|	number|	5–90|	20|	Camera field of view (degrees)|
 |`ambient_light_color`|	color|	—|	#f0f0f0|	Ambient light colour|
 |`spot_light_color`|	color|	—|	#efefef|	Spot light colour|
@@ -1198,7 +1206,7 @@ Every parameter below can be read with box.getParam(), written with box.setParam
 |----|----|----|----|----|
 |`d100_compound`|	boolean|	—|	true|	Roll d100 as a tens die + a units die|
 |`max_recursion_depth`|	integer| 1–50|	10	|Maximum explosion/reroll phases|
-|`max_dice_per_roll`|	integer|	1–500|	100	|Total dice cap across all phases|
+|`max_dice_per_roll`|	integer|	1–500|	100	|Maximum combined count of kept dice plus the current phase's dice. Note: does not count dropped dice, so a roll with many drops can exceed the nominal cap.|
 |`explosion_delay_ms`|	integer|	0–1500	|300	|Delay between explosion phases|
 ### Size Control
 |Parameter|Type|Range|Default|Description|
@@ -1230,7 +1238,7 @@ scale  = baseScale * sizeMultiplier * factor
 ### Timeouts and Reproducibility
 |Parameter|Type|Range|Default|Description|
 |----|----|----|----|----|
-|`roll_timeout_ms`|	integer|	0–120000|	20000|	Force-reset rolling if exceeded. 0 |disables
+|`roll_timeout_ms`|	integer|	0–120000|	20000|	Force-reset rolling if exceeded. 0 disables|
 |`rng_seed`|	integer | null|	0 to 2³¹−1|	null|	Seed for reproducible rolls. null = random|
 ___
 ## Result Object Reference
@@ -1244,6 +1252,8 @@ The Promise from `roll()` resolves with an object containing everything about th
 |`diceResults`|	object[]|	One entry per logical die, including dropped dice. See below.|
 |`resultTotal`|	number|	Final numeric result|
 |`resultString`|	string|	Human-readable summary, e.g. "4 3 5 6 = 18"|
+|`successCount`|	number|	Number of kept dice that matched a `t` or `cs` rule. 0 if no such rule.|
+|`failureCount`|	number|	Number of kept dice that matched an `f` or `cf` rule. 0 if no such rule.|
 |`audit`|	object[]|	Structured audit trail of every rule application|
 |`auditString`|	string	|The audit trail formatted as plain English|
 |`error`|	boolean|	True if the roll failed|
@@ -1265,12 +1275,17 @@ compound mode is a single entry, not two. The fields are:
 | `critical` | `boolean` | True if a `cs` or `cf` rule matched this die. |
 | `success` | `boolean` | True if a `cs` or `t` rule marked this die a success. |
 | `failure` | `boolean` | True if a `cf` or `f` rule marked this die a failure. |
+| `subResults` | `object[]` | Raw physical dice contributing to this logical die. For non-compound, one entry; for compound, two (tens, units).  
 
-`critical` is a **modifier**, not a category — it says "this die's
+Note: `critical` is a **modifier**, not a category — it says "this die's
 success or failure was critical", but does not itself say which. A
 critical success is `{ critical: true, success: true }`; a critical
 failure is `{ critical: true, failure: true }`. Always check the
 success/failure flag before checking `critical`.
+
+Note: for penetrating rolls (p), a follow-up die appears in `diceResults` with its raw face value, but contributes value − 1 to result and resultTotal. This lets a presentation layer show what actually came up while preserving the correct total.
+
+Note: =Error-shaped results carry the same fields as successful results, with `result: []`, `diceResults: []`, `resultTotal: 0`, `audit: []`, `successCount: 0`, `failureCount: 0`, and `errorMessage` / `errorCode` describing the failure. However error-shaped results never carry the `silent` flag; check your call site to distinguish
 
 ### Audit Trail Format
 Each audit entry has this shape:
@@ -1503,7 +1518,7 @@ console.log((await visual).resultTotal);
 The silent result arrives first. The visual roll continues as normal and eventually resolves with its own result.
 
 ## Browser Support and Mobile Notes
-WebGL is required. The library falls back to THREE.CanvasRenderer if WebGL isn't available, but visual quality is dramatically reduced.
+WebGL is strongly preferred. Without it the library falls back to THREE.CanvasRenderer, but visual quality is dramatically reduced.
 
 The container must have a non-zero rendered size when the first roll is attempted. If you construct the dice_box before the container has laid out (common with flex/grid layouts, or if the element is added to the DOM in the same tick), rolls will fail with a RENDER_FAILED error.
 
@@ -1556,17 +1571,17 @@ Both libraries operate on the same grammar. A term is one of:
 <term>kl<n>                 // keep lowest n
 <term>dh<n>                 // drop highest n
 <term>dl<n>                 // drop lowest n
-<term>!{op}{v}              // explode on {op} v   (op defaults to '=')
-<term>!!{op}{v}             // compounding explosion
-<term>p                    // penetrating explosion
-<term>r{n}{op}{v}           // reroll up to n times
+<term>!{op}{v}              // explode on {op} v   (op defaults to '>=')
+<term>!!{op}{v}             // compounding explosion (currently treated as !)
+<term>p                     // penetrating explosion
+<term>r{n}{op}{v}           // reroll while condition matches
 <term>ro{op}{v}             // reroll once
-<term>er                   // explode on max, reroll 1s
-<term>sa | sd              // sort ascending / descending
+<term>er                    // explode on max, reroll 1s
+<term>sa | sd               // sort ascending / descending
 <term>cs{op}{v}             // critical success
 <term>cf{op}{v}             // critical failure
-<term>t{n}                  // target number
-<term>f{n}                  // failures
+<term>t{op}{v}              // target number
+<term>f{op}{v}              // failures
 ```
 
 Terms are joined with `+`. Constants (`+5`, `-2`) are added to the total.
