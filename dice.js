@@ -1579,6 +1579,8 @@ var DICE = (function() {
             diceResults: [],
             resultTotal: 0,
             resultString: '',
+            successCount: 0,
+            failureCount: 0,   
             audit: [],      // will be populated during rolling
             auditString: '',
             error: false,
