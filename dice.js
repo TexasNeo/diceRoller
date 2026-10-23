@@ -804,10 +804,10 @@ var DICE = (function() {
                         if (rule.type === 'reroll' && rule.once && groupDef._rerolledOnce) continue;
 
                         if (rule.type === 'explode' || rule.type === 'explode-compounding') {
-                            var maxFace = die_max_value(die.type);
+                            var maxFace = logical_max_value(die.type);
                             var shouldExplode = (rule.threshold === 'max')
                                 ? die.value === maxFace
-                                : compareValues(die.value, rule.condition || 'greater-than', rule.threshold);
+                                : compareValues(die.value, rule.condition || 'greater-equal', rule.threshold);
                             if (shouldExplode) {
                                 explodedDice.push(die);
                                 logEvent(audit, phase, 'explode', 'Die #' + die.diceId + ' (value ' + die.value + ') exploded.', { diceId: die.diceId, value: die.value, rule: rule.type });
@@ -815,7 +815,7 @@ var DICE = (function() {
                         }
 
                         if (rule.type === 'reroll') {
-                            if (compareValues(die.value, rule.condition || 'less-than', rule.threshold)) {
+                            if (compareValues(die.value, rule.condition || 'less-equal', rule.threshold)) {
                                 die.kept = false;
                                 if (rule.once) die._triggeredOnce = true;
                                 rerolledDice.push(die);
@@ -824,7 +824,7 @@ var DICE = (function() {
                         }
 
                         if (rule.type === 'penetrate') {
-                            var penMax = die_max_value(die.type);
+                            var penMax = logical_max_value(die.type);
                             if (die.value >= penMax) {
                                 die._triggeredPenetrate = true;
                                 explodedDice.push(die);
@@ -857,22 +857,30 @@ var DICE = (function() {
 
             var targetThreshold = notation._targetThreshold;
             var failureThreshold = notation._failureThreshold;
-            var finalValue;
-            var penetratingReduction = 0;
             var isCountMode = (targetThreshold !== undefined) || (failureThreshold !== undefined);
+
+            var finalValue = 0;
+            var penetratingReduction = 0;
+            var successCount = 0;
+            var failureCount = 0;
 
             if (targetThreshold !== undefined) {
                 var targetOp = notation._targetCondition || 'greater-equal';
-                finalValue = 0;
                 for (var i = 0; i < keptAccum.length; i++) {
-                    if (compareValues(keptAccum[i].value, targetOp, targetThreshold)) finalValue++;
+                    if (compareValues(keptAccum[i].value, targetOp, targetThreshold)) successCount++;
                 }
+            }
+            if (failureThreshold !== undefined) {
+                var failOp = notation._failureCondition || 'less-equal';
+                for (var i = 0; i < keptAccum.length; i++) {
+                    if (compareValues(keptAccum[i].value, failOp, failureThreshold)) failureCount++;
+                }
+            }
+
+            if (targetThreshold !== undefined) {
+                finalValue = successCount;
             } else if (failureThreshold !== undefined) {
-                var failOp = notation._failureCondition || 'less-than';
-                finalValue = 0;
-                for (var i = 0; i < keptAccum.length; i++) {
-                    if (compareValues(keptAccum[i].value, failOp, failureThreshold)) finalValue++;
-                }
+                finalValue = failureCount;
             } else {
                 finalValue = notation.constant || 0;
                 for (var i = 0; i < keptAccum.length; i++) {
@@ -888,11 +896,11 @@ var DICE = (function() {
 
             keptAccum = sortKeptDice(keptAccum, notation);
 
-            var values = keptAccum.map(function(d) { return d.value; });
+            var values = keptAccum.map(function(d) {
+                return d._isPenetratingFollowUp ? Math.max(0, d.value - 1) : d.value;
+            });
             var resultString = values.join(' ');
-            if (penetratingReduction > 0) {
-                resultString += ' (penetrating: -' + penetratingReduction + ')';
-            }
+           
             if (!isCountMode && notation.constant) {
                 if (notation.constant > 0) resultString += ' +' + notation.constant;
                 else resultString += ' -' + Math.abs(notation.constant);
@@ -905,10 +913,12 @@ var DICE = (function() {
                 groups: notation.groups,
                 set: notation.set,
                 constant: notation.constant || 0,
-                result: keptAccum.map(function(d) { return d.value; }),
+                result: values.slice(),
                 diceResults: allDiceAccum,
                 resultTotal: finalValue,
                 resultString: resultString,
+                successCount: successCount,
+                failureCount: failureCount,
                 audit: audit,
                 auditString: that.formatAudit(audit),
                 error: false,
@@ -945,6 +955,8 @@ var DICE = (function() {
             diceResults: [],
             resultTotal: 0,
             resultString: 'Error: ' + (error.userMessage || error.message),
+            successCount: 0,
+            failureCount: 0,
             audit: [],
             auditString: ''
         };
@@ -1539,17 +1551,18 @@ var DICE = (function() {
      *
      * Supported rules (applied in order):
      *   - khN / klN / dhN / dlN  (keep/drop highest/lowest)
-     *   - ! or !>N               (explode on max or >N)
+     *   - ! or !>N               (explode on max, or on value > N)
      *   - !! or !!>N             (compounding explosion)
-     *   - p                      (penetrating, WoD style – subtract 1 on each explosion)
-     *   - rN or r>N              (reroll until success, condition value < N or >N)
-     *   - roN or ro>N            (reroll exactly once)
-     *   - er                     (explode & reroll 1s)
+     *   - p                      (penetrating, WoD style – follow-ups contribute value - 1)
+     *   - rN or r<N              (reroll while value <= N with bare rN,
+     *                             or while value < N with explicit r<N)
+     *   - roN or ro<N            (reroll exactly once, same N semantics as rN)
+     *   - er                     (explode on max, and reroll 1s indefinitely)
      *   - sa / sd                (sort ascending/descending)
-     *   - cs>N                   (critical success if value > N)
-     *   - cf<N                   (critical failure if value < N)
+     *   - csN or cs>N            (critical success if value >= N)
+     *   - cfN or cf<N            (critical failure if value <= N)
      *   - tN                     (count successes, value >= N)
-     *   - fN                     (count failures, value < N)
+     *   - fN                     (count failures, value <= N)
      *
      * Rules are stored in a `rules` array on each group.
      *
@@ -1760,7 +1773,7 @@ var DICE = (function() {
                             rules.push({
                                 type: 'reroll',
                                 threshold: parseInt(numMatch[1], 10),
-                                condition: 'less-than',
+                                condition: 'less-equal',
                                 once: true
                             });
                             remaining = rest.substring(numMatch[0].length);
@@ -1789,7 +1802,7 @@ var DICE = (function() {
                             rules.push({
                                 type: 'reroll',
                                 threshold: parseInt(numMatch[1], 10),
-                                condition: 'less-than',
+                                condition: 'less-equal',
                                 once: false
                             });
                             remaining = rest.substring(numMatch[0].length);
@@ -1803,7 +1816,7 @@ var DICE = (function() {
                         rules.push({
                             type: 'reroll',
                             threshold: 1,
-                            condition: 'less-than',
+                            condition: 'equal',
                             once: false
                         });
                         rules.push({ type: 'explode', threshold: 'max' });
@@ -1845,7 +1858,7 @@ var DICE = (function() {
                             rules.push({
                                 type: 'critical-success',
                                 threshold: parseInt(numMatch[1], 10),
-                                condition: 'greater-than'
+                                condition: 'greater-equal'
                             });
                             remaining = rest.substring(numMatch[0].length);
                             matched = true;
@@ -1872,7 +1885,7 @@ var DICE = (function() {
                             rules.push({
                                 type: 'critical-failure',
                                 threshold: parseInt(numMatch[1], 10),
-                                condition: 'less-than'
+                                condition: 'less-equal'
                             });
                             remaining = rest.substring(numMatch[0].length);
                             matched = true;
@@ -1926,7 +1939,7 @@ var DICE = (function() {
                             rules.push({
                                 type: 'failures',
                                 threshold: parseInt(numMatch[1], 10),
-                                condition: 'less-than'
+                                condition: 'less-equal'
                             });
                             remaining = rest.substring(numMatch[0].length);
                             matched = true;
@@ -2032,30 +2045,30 @@ var DICE = (function() {
                             case 'drop-lowest': notation += 'dl' + rule.count; break;
                             case 'explode':
                                 if (rule.threshold === 'max') notation += '!';
-                                else notation += '!' + conditionToString(rule.condition || 'greater-than', rule.threshold);
+                                else notation += '!' + conditionToString(rule.condition || 'greater-equal', rule.threshold);
                                 break;
                             case 'explode-compounding':
                                 if (rule.threshold === 'max') notation += '!!';
-                                else notation += '!!' + conditionToString(rule.condition || 'greater-than', rule.threshold);
+                                else notation += '!!' + conditionToString(rule.condition || 'greater-equal', rule.threshold);
                                 break;
                             case 'penetrate': notation += 'p'; break;
                             case 'reroll':
                                 var prefix = rule.once ? 'ro' : 'r';
-                                notation += prefix + conditionToString(rule.condition || 'less-than', rule.threshold);
+                                notation += prefix + conditionToString(rule.condition || 'less-equal', rule.threshold);
                                 break;
                             case 'sort-ascending': notation += 'sa'; break;
                             case 'sort-descending': notation += 'sd'; break;
                             case 'critical-success':
-                                notation += 'cs' + conditionToString(rule.condition || 'greater-than', rule.threshold);
+                                notation += 'cs' + conditionToString(rule.condition || 'greater-equal', rule.threshold);
                                 break;
                             case 'critical-failure':
-                                notation += 'cf' + conditionToString(rule.condition || 'less-than', rule.threshold);
+                                notation += 'cf' + conditionToString(rule.condition || 'less-equal', rule.threshold);
                                 break;
                             case 'target-number':
                                 notation += 't' + conditionToString(rule.condition || 'greater-equal', rule.threshold);
                                 break;
                             case 'failures':
-                                notation += 'f' + conditionToString(rule.condition || 'less-than', rule.threshold);
+                                notation += 'f' + conditionToString(rule.condition || 'less-equal', rule.threshold);
                                 break;
 
                             default: break;
@@ -2149,9 +2162,10 @@ var DICE = (function() {
      *     is not represented here because compounding is handled at the
      *     result-evaluation layer, not at the die level.
      *
-     * The primary consumer is the explosion rule: `threshold: 'max'` resolves
-     * to this value, so a d6 explodes on 6, a d10 explodes on 10, a d20
-     * explodes on 20, and so on.
+     * The physical maximum. Consumers that need the logical maximum (e.g.
+     * the explosion and penetrate rules) should call logical_max_value(),
+     * which delegates to this function for single-die types and returns
+     * 100 for compound d100.
      *
      * @param {string} type - Die type, e.g. 'd6', 'd20'.
      * @returns {number} The die's maximum public face value. Returns 0 for
@@ -2421,7 +2435,7 @@ var DICE = (function() {
 
                 // Critical success/failure – just set flags on the die object
                 if (type === 'critical-success') {
-                    var csCond = rule.condition || 'greater-than';
+                    var csCond = rule.condition || 'greater-equal';
                     for (var d = 0; d < groupDice.length; d++) {
                         if (compareValues(groupDice[d].value, csCond, rule.threshold)) {
                             groupDice[d].critical = true;
@@ -2431,7 +2445,7 @@ var DICE = (function() {
                     logEvent(audit, phase, 'critical', 'Marked critical successes (' + conditionToString(csCond, rule.threshold) + ').', { rule: type, threshold: rule.threshold, condition: csCond });
                 }
                 if (type === 'critical-failure') {
-                    var cfCond = rule.condition || 'less-than';
+                    var cfCond = rule.condition || 'less-equal';
                     for (var d = 0; d < groupDice.length; d++) {
                         if (compareValues(groupDice[d].value, cfCond, rule.threshold)) {
                             groupDice[d].critical = true;
@@ -2455,7 +2469,7 @@ var DICE = (function() {
                 }
                 if (type === 'failures') {
                     notation._failureThreshold = rule.threshold;
-                    notation._failureCondition = rule.condition || 'less-than';
+                    notation._failureCondition = rule.condition || 'less-equal';
                     for (var d = 0; d < groupDice.length; d++) {
                         if (compareValues(groupDice[d].value,
                                         notation._failureCondition,
@@ -2626,6 +2640,7 @@ var DICE = (function() {
         keptAccum,
         allDiceAccum
     ) {
+    
         if (depth > maxDepth) {
             var err = createDiceError('RECURSION_DEPTH_EXCEEDED', 'Max recursion depth reached (' + maxDepth + ').');
             parsedNotation.error = true;
@@ -2701,14 +2716,29 @@ var DICE = (function() {
                     for (var ri = 0; ri < groupDef.rules.length; ri++) {
                         var rule = groupDef.rules[ri];
 
-                        // Once-rerolls are consumed for follow-ups from a previous once-reroll
                         if (rule.type === 'reroll' && rule.once && groupDef._rerolledOnce) continue;
 
-                        // ... existing explode / explode-compounding / reroll / penetrate blocks ...
+                        // Explosion
+                        if (rule.type === 'explode' || rule.type === 'explode-compounding') {
+                            var maxVal = logical_max_value(die.type);
+                            var explodeCondition = false;
+                            if (rule.threshold === 'max') {
+                                if (die.value === maxVal) explodeCondition = true;
+                            } else {
+                                var explodeOp = rule.condition || 'greater-equal';
+                                if (compareValues(die.value, explodeOp, rule.threshold)) explodeCondition = true;
+                            }
+                            if (explodeCondition) {
+                                explodedDice.push(die);
+                                var mesh = box.dices.find(function(m) { return m.dice_id === die.diceId; });
+                                if (mesh) apply_explosion_highlight(mesh);
+                                logEvent(audit, depth, 'explode', 'Die #' + die.diceId + ' (value ' + die.value + ') exploded.', { diceId: die.diceId, value: die.value, rule: rule.type });
+                            }
+                        }
 
-                        // In the reroll block, tag the die so build_next_notation can split it:
+                        // Reroll
                         if (rule.type === 'reroll') {
-                            var rerollOp = rule.condition || 'less-than';
+                            var rerollOp = rule.condition || 'less-equal';
                             if (compareValues(die.value, rerollOp, rule.threshold)) {
                                 die.kept = false;
                                 phaseTotal -= contrib;
@@ -2718,9 +2748,9 @@ var DICE = (function() {
                             }
                         }
 
-                        // In the penetrate block, use die_max_value and tag the die:
+                        // Penetrate
                         if (rule.type === 'penetrate') {
-                            var penMax = die_max_value(die.type);
+                            var penMax = logical_max_value(die.type);
                             if (die.value >= penMax) {
                                 die._penetrate = true;
                                 die._triggeredPenetrate = true;
@@ -2803,6 +2833,27 @@ var DICE = (function() {
     }
 
     /**
+     * Returns the logical maximum for a die type.
+     *
+     * This is the value that a "roll of max" means at the result layer, which
+     * for compound d100 rolls is 100 rather than the physical tens-face max
+     * of 9. Consumers:
+     *
+     *   - The explosion rule uses this to decide when `threshold: 'max'` fires.
+     *   - The penetrate rule uses this to decide when a die penetrates.
+     *
+     * For non-compound d100 (rare), or any other type, this delegates to
+     * die_max_value().
+     *
+     * @param {string} type - Die type, e.g. 'd6', 'd20', 'd100'.
+     * @returns {number} The logical maximum, or 0 if the type is unrecognised.
+     */
+    function logical_max_value(type) {
+        if (type === 'd100' && vars.d100_compound) return 100;
+        return die_max_value(type);
+    }
+
+    /**
      * Assembles the final result object and delivers it to the caller.
      *
      * Called by _process_recursive_roll when no further phases are needed,
@@ -2820,6 +2871,12 @@ var DICE = (function() {
      *     that satisfy the failure condition.
      *   - Default: the result is the sum of kept dice plus any constant.
      *
+     * * In penetration rolls, follow-up dice contribute one less than their
+     * rolled value. Both `result` and `resultString` expose the adjusted
+     * values so the visible numbers sum to `resultTotal`; `diceResults`
+     * continues to hold the raw rolls so callers can trace what was
+     * actually physically rolled.
+     * 
      * The final `keptAccum` array is re-ordered via sortKeptDice so that dice
      * from the same notation group appear together and honour their sort
      * rules. This is what makes `4d6sa` present its results sorted rather
@@ -2853,31 +2910,37 @@ var DICE = (function() {
      * @returns {void}
      */
     function _finalise_roll(box, lastNotation, finalTotal, afterRollCb, keptAccum, allDiceAccum, audit) {
-        // Fall back to the original notation so constant/groups survive recursion
         var original = box._originalNotation || lastNotation;
 
         var constVal          = original.constant || 0;
-        var targetThreshold   = original._targetThreshold;
-        var failureThreshold  = original._failureThreshold;
-        var isCountMode       = (targetThreshold !== undefined) || (failureThreshold !== undefined);
+        var targetThreshold = original._targetThreshold;
+        var failureThreshold = original._failureThreshold;
+        var isCountMode = (targetThreshold !== undefined) || (failureThreshold !== undefined);
 
         var finalValue = 0;
         var penetratingReduction = 0;
+        var successCount = 0;
+        var failureCount = 0;
 
         if (targetThreshold !== undefined) {
             var targetOp = original._targetCondition || 'greater-equal';
             for (var i = 0; i < keptAccum.length; i++) {
-                if (compareValues(keptAccum[i].value, targetOp, targetThreshold)) finalValue++;
+                if (compareValues(keptAccum[i].value, targetOp, targetThreshold)) successCount++;
             }
-        } else if (failureThreshold !== undefined) {
-            var failOp = original._failureCondition || 'less-than';
+        }
+        if (failureThreshold !== undefined) {
+            var failOp = original._failureCondition || 'less-equal';
             for (var i = 0; i < keptAccum.length; i++) {
-                if (compareValues(keptAccum[i].value, failOp, failureThreshold)) finalValue++;
+                if (compareValues(keptAccum[i].value, failOp, failureThreshold)) failureCount++;
             }
+        }
+
+        if (targetThreshold !== undefined) {
+            finalValue = successCount;
+        } else if (failureThreshold !== undefined) {
+            finalValue = failureCount;
         } else {
-            // Sum mode: recompute from keptAccum so the constant and penetrate
-            // reduction are applied consistently with the silent path.
-            finalValue = constVal;
+            finalValue = original.constant || 0;
             for (var i = 0; i < keptAccum.length; i++) {
                 var contrib = keptAccum[i].value;
                 if (keptAccum[i]._isPenetratingFollowUp) {
@@ -2893,11 +2956,10 @@ var DICE = (function() {
             keptAccum = sortKeptDice(keptAccum, original);
         }
 
-        var values = keptAccum.map(d => d.value);
+        var values = keptAccum.map(d => d._isPenetratingFollowUp ? Math.max(0, d.value - 1) : d.value);
+        
         var resultString = values.join(' ');
-        if (penetratingReduction > 0) {
-            resultString += ' (penetrating: -' + penetratingReduction + ')';
-        }
+    
         // Constant is only meaningful in sum mode — suppress it in count mode.
         if (!isCountMode && constVal) {
             if (constVal > 0) resultString += ' +' + constVal;
@@ -2911,10 +2973,12 @@ var DICE = (function() {
             groups: original.groups,
             set: original.set,
             constant: constVal,
-            result: keptAccum.map(d => d.value),
+            result: values.slice(),
             diceResults: allDiceAccum,
             resultTotal: finalValue,
             resultString: resultString,
+            successCount: successCount,
+            failureCount: failureCount,
             audit: audit,
             auditString: that.formatAudit(audit),
             error: false
@@ -3084,52 +3148,25 @@ var DICE = (function() {
                 // _roll_phase handles both cases (with and without forced values).
                 box._roll_phase(vectors, request_results || notation.result, function(rawDiceResults) {
                     try {
-                        // Now evaluate keep/drop on combined results (no recursion)
                         var combined = combine_compound_results(rawDiceResults, box.dices);
-                        
-                        // Build audit for simple roll
+
                         var audit = [];
-                        var vals = combined.map(d => d.value).join(', ');
-                        logEvent(audit, 0, 'roll', 'Rolled ' + combined.length + ' dice: ' + vals + '.', { dice: combined.map(d => ({id: d.diceId, value: d.value})) });
-                        
-                        // Apply keep/drop with audit
+                        var vals = combined.map(function(d) { return d.value; }).join(', ');
+                        logEvent(audit, 0, 'roll', 'Rolled ' + combined.length + ' dice: ' + vals + '.', {
+                            dice: combined.map(function(d) { return { id: d.diceId, value: d.value }; })
+                        });
+
                         apply_static_rules(notation, combined, audit, 0);
                         apply_dropped_visuals_to_compound(combined, box.dices);
                         apply_result_highlights(box, combined);
-                        box.renderer.render(box.scene, box.camera);   
+                        box.renderer.render(box.scene, box.camera);
 
-                        // Build final notation
-                        var kept = combined.filter(d => d.kept);
-                        kept = sortKeptDice(kept, notation);
-                        var resultTotal = 0;
-                        for (var i = 0; i < kept.length; i++) resultTotal += kept[i].value;
-                        resultTotal += notation.constant || 0;
-                        var resultString = kept.map(d => d.value).join(' ');
-                        if (notation.constant) {
-                            if (notation.constant > 0) resultString += ' +' + notation.constant;
-                            else resultString += ' -' + Math.abs(notation.constant);
-                        }
-                        if (kept.length > 1 || notation.constant) {
-                            resultString += ' = ' + resultTotal;
-                        }
-                        notation.result = kept.map(d => d.value);
-                        notation.diceResults = combined;
-                        notation.resultTotal = resultTotal;
-                        notation.resultString = resultString;
-                        notation.audit = audit;
-                        notation.auditString = that.formatAudit(audit);
-                        if (after_roll) after_roll(notation);
-                        console.log('Dice Roll: Final result:', notation.resultString, 'Total:', notation.resultTotal, 'Full Result:', notation);
-                        box.rolling = false;
-                        _clearRollWatchdog(box);
-                        vars.use_adaptive_timestep = uat;
-                        box._scheduleFade();
+                        var kept = combined.filter(function(d) { return d.kept; });
+                        _finalise_roll(box, notation, 0, after_roll, kept, combined, audit);
                     } catch (e) {
                         var err = createDiceError('UNKNOWN_ERROR', null, e);
                         _handleDiceError(box, err, after_roll, notation);
-                        return; 
                     }
-                    
                 });
             } catch (e) {
                 var err = createDiceError('VECTOR_GENERATION_FAILED', null, e);
@@ -4710,41 +4747,6 @@ var DICE = (function() {
                 if (mesh) apply_critical_highlight(mesh, isFailure);
             }
         }
-    }
-
-    /**
-     * Calculates the final numeric result.
-     *
-     * Only dice marked as kept contribute to the total.
-     *
-     * @param {Object[]} diceResults
-     * @param {number} constant
-     * @returns {number}
-     */
-    function calculate_result(
-        diceResults,
-        constant
-    ) {
-
-        var total =
-            constant || 0;
-
-        for (
-            var i = 0;
-            i < diceResults.length;
-            i++
-        ) {
-
-            if (
-                diceResults[i].kept
-            ) {
-
-                total +=
-                    diceResults[i].value;
-            }
-        }
-
-        return total;
     }
 
     /**
