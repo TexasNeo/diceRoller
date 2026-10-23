@@ -3756,6 +3756,10 @@ var DICE = (function() {
             cancelAnimationFrame(this._fadeRafId);
             this._fadeRafId = null;
         }
+        if (this._clearTimeout) {
+            clearTimeout(this._clearTimeout);
+            this._clearTimeout = null;
+        }
 
         this.running = false;
 
@@ -3787,13 +3791,21 @@ var DICE = (function() {
 
         var box = this;
 
-        setTimeout(
+        box._clearTimeout = setTimeout(
             function() {
 
-                box.renderer.render(
-                    box.scene,
-                    box.camera
-                );
+                box._clearTimeout = null;
+
+                // destroy() may have nulled scene/camera between scheduling
+                // and firing. Skip the cleanup render in that case.
+                if (box.scene && box.camera) {
+                    try {
+                        box.renderer.render(
+                            box.scene,
+                            box.camera
+                        );
+                    } catch (e) { /* ignore */ }
+                }
 
             },
             100
@@ -3807,6 +3819,12 @@ var DICE = (function() {
     that.dice_box.prototype.destroy = function() {
         _clearRollWatchdog(this);
         this.clear();
+
+        if (this._clearTimeout) {
+            clearTimeout(this._clearTimeout);
+            this._clearTimeout = null;
+        }
+        
         if (this._resizeObserver) this._resizeObserver.disconnect();
         if (this._fadeTimeout) clearTimeout(this._fadeTimeout);
         if (this._fadeRafId) cancelAnimationFrame(this._fadeRafId);
