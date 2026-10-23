@@ -6779,6 +6779,349 @@ var DICE = (function() {
     }
 
 
+    // ---------------------------------------------------------------------
+    // SELF-TEST SUITE
+    // ---------------------------------------------------------------------
+
+    /**
+     * Runs the built-in release test suite.
+     *
+     * Runs a battery of deterministic and probabilistic checks against the
+     * loaded library and reports pass/fail. Designed to be invoked on each
+     * release (or after a code change) to verify that the result payload
+     * shape, mode selection, keep/drop handling, constants, penetration,
+     * error handling, and dynamic-rule firing all behave as documented.
+     *
+     * Safe to call in production: it never touches an existing dice_box,
+     * never modifies global config, and cleans up every DOM element,
+     * timer, and animation frame it creates before returning. It does
+     * create a throwaway dice_box for the rendered checks unless those
+     * are skipped (either explicitly or because THREE/CANNON/DOM are
+     * unavailable).
+     *
+     * Rejects are converted to failed checks — the returned Promise
+     * always resolves, with the failing cases reported in the result.
+     *
+     * @param {Object} [options]
+     * @param {number} [options.samples=100] - Iterations for probabilistic
+     *        checks. Higher = more reliable, slower. Clamped to [1, 10000].
+     * @param {boolean} [options.skipStatistical=false] - Skip the
+     *        probabilistic checks entirely (useful in CI where wall
+     *        clock matters more than coverage).
+     * @param {boolean} [options.skipRendered=false] - Skip the rendered
+     *        dice_box checks. Auto-skipped when THREE, CANNON, or the
+     *        DOM aren't available.
+     * @param {HTMLElement} [options.container] - Optional container to
+     *        use for the rendered checks. If omitted, a temporary
+     *        off-screen div is created and removed. Any container you
+     *        supply is preserved (only the dice_box mounted into it is
+     *        destroyed).
+     * @param {boolean} [options.verbose=true] - Log per-check results to
+     *        the console as the suite runs.
+     * @returns {Promise<{pass: number, fail: number, results: Array, summary: string}>}
+     */
+    that.runTests = function(options) {
+        var opts = options || {};
+        var samples = Math.max(1, Math.min(10000,
+            opts.samples !== undefined ? opts.samples : 100));
+        var skipStatistical = !!opts.skipStatistical;
+        var skipRendered = !!opts.skipRendered;
+        var verbose = opts.verbose !== undefined ? opts.verbose : true;
+        var externalContainer = opts.container || null;
+        var createdContainer = null;
+
+        return (async function() {
+            var pass = 0;
+            var fail = 0;
+            var results = [];
+
+            function check(name, condition, extra) {
+                if (condition) {
+                    pass++;
+                    results.push({ ok: true, name: name });
+                    if (verbose) console.log('  \u2713 ' + name);
+                } else {
+                    fail++;
+                    results.push({ ok: false, name: name, extra: extra });
+                    if (verbose) {
+                        var suffix = '';
+                        if (extra !== undefined) {
+                            suffix = ' \u2014 ' + (typeof extra === 'object'
+                                ? JSON.stringify(extra) : String(extra));
+                        }
+                        console.log('  \u2717 ' + name + suffix);
+                    }
+                }
+                return condition;
+            }
+
+            function group(title) {
+                if (verbose) console.log('\n' + title);
+                results.push({ group: title });
+            }
+
+            try {
+                // ── 1. Result shape ─────────────────────────────────────
+                group('Result shape');
+                {
+                    var r = await that.rollSilent('4d6');
+                    check('has groups', Array.isArray(r.groups) && r.groups.length === 1);
+                    check('has set', Array.isArray(r.set) && r.set.length === 4);
+                    check('has diceResults', Array.isArray(r.diceResults) && r.diceResults.length === 4);
+                    check('has result', Array.isArray(r.result) && r.result.length === 4);
+                    check('has audit', Array.isArray(r.audit) && r.audit.length > 0);
+                    check('has auditString', typeof r.auditString === 'string' && r.auditString.length > 0);
+                    check('has resultTotal', typeof r.resultTotal === 'number');
+                    check('has resultString', typeof r.resultString === 'string');
+                    check('has successCount', 'successCount' in r);
+                    check('has failureCount', 'failureCount' in r);
+                    check('has silent=true', r.silent === true);
+                    check('has error=false', r.error === false);
+                }
+
+                // ── 2. Mode selection ──────────────────────────────────
+                group('Mode selection');
+                {
+                    var r = await that.rollSilent('4d6t1');
+                    check('tN: resultTotal === successCount',
+                        r.resultTotal === r.successCount,
+                        { total: r.resultTotal, sc: r.successCount });
+                    check('tN: successCount === 4', r.successCount === 4, r.successCount);
+                    check('tN: failureCount === 0', r.failureCount === 0, r.failureCount);
+                }
+                {
+                    var r = await that.rollSilent('4d6f6');
+                    check('fN: resultTotal === failureCount',
+                        r.resultTotal === r.failureCount,
+                        { total: r.resultTotal, fc: r.failureCount });
+                    check('fN: failureCount === 4', r.failureCount === 4, r.failureCount);
+                    check('fN: successCount === 0', r.successCount === 0, r.successCount);
+                }
+                {
+                    var r = await that.rollSilent('4d6t3f1');
+                    check('tN+fN: resultTotal === successCount',
+                        r.resultTotal === r.successCount,
+                        { total: r.resultTotal, sc: r.successCount });
+                    check('tN+fN: failureCount computed',
+                        typeof r.failureCount === 'number' && r.failureCount >= 0);
+                    check('tN+fN: sum of result values > 0',
+                        r.result.reduce(function(a, b) { return a + b; }, 0) > 0);
+                }
+                {
+                    var r = await that.rollSilent('4d6');
+                    var sum = r.result.reduce(function(a, b) { return a + b; }, 0);
+                    check('sum: resultTotal === sum(result)',
+                        r.resultTotal === sum,
+                        { total: r.resultTotal, sum: sum });
+                }
+
+                // ── 3. Keep/drop and diceResults ──────────────────────
+                group('Keep/drop and diceResults');
+                {
+                    var r = await that.rollSilent('4d6dl1');
+                    check('dl1: 4 dice in diceResults',
+                        r.diceResults.length === 4, r.diceResults.length);
+                    check('dl1: exactly 1 dropped',
+                        r.diceResults.filter(function(d) { return !d.kept; }).length === 1);
+                    check('dl1: 3 in result',
+                        r.result.length === 3, r.result.length);
+                    check('dl1: dropped dice retain value',
+                        r.diceResults.every(function(d) { return typeof d.value === 'number'; }));
+                }
+                {
+                    var r = await that.rollSilent('2d20kh1');
+                    check('kh1: 2 dice in diceResults',
+                        r.diceResults.length === 2, r.diceResults.length);
+                    check('kh1: exactly 1 kept',
+                        r.diceResults.filter(function(d) { return d.kept; }).length === 1);
+                    check('kh1: 1 in result',
+                        r.result.length === 1);
+                    var kept = r.diceResults.find(function(d) { return d.kept; });
+                    var dropped = r.diceResults.find(function(d) { return !d.kept; });
+                    check('kh1: kept >= dropped',
+                        kept.value >= dropped.value,
+                        { kept: kept.value, dropped: dropped.value });
+                }
+
+                // ── 4. Constants ───────────────────────────────────────
+                group('Constants');
+                {
+                    var r = await that.rollSilent('4d6 + 5');
+                    var sum = r.result.reduce(function(a, b) { return a + b; }, 0);
+                    check('static: +5 in total',
+                        r.resultTotal === sum + 5,
+                        { total: r.resultTotal, sum: sum });
+                    check('static: +5 in string',
+                        r.resultString.indexOf('+5') !== -1);
+                }
+                {
+                    var r = await that.rollSilent('4d6t3 + 5');
+                    check('target+const: total === successCount',
+                        r.resultTotal === r.successCount);
+                    check('target+const: +5 NOT in string',
+                        r.resultString.indexOf('+5') === -1);
+                }
+
+                // ── 5. Penetration ─────────────────────────────────────
+                group('Penetration');
+                {
+                    var r = await that.rollSilent('1d6p');
+                    var sum = r.result.reduce(function(a, b) { return a + b; }, 0);
+                    check('1d6p: sum(result) === resultTotal',
+                        sum === r.resultTotal,
+                        { sum: sum, total: r.resultTotal });
+                    check('1d6p: diceResults populated',
+                        r.diceResults.length >= 1);
+                }
+
+                // ── 6. Error handling ──────────────────────────────────
+                group('Error handling');
+                {
+                    var caught = null;
+                    try { await that.rollSilent(''); } catch (e) { caught = e; }
+                    check('empty notation rejects', caught && caught.error === true);
+                    check('empty notation has errorMessage',
+                        caught && typeof caught.errorMessage === 'string');
+                    check('empty notation has successCount',
+                        caught && 'successCount' in caught);
+                    check('empty notation has failureCount',
+                        caught && 'failureCount' in caught);
+                }
+                {
+                    var caught = null;
+                    try { await that.rollSilent('4d7'); } catch (e) { caught = e; }
+                    check('unsupported die rejects', caught && caught.error === true);
+                }
+                {
+                    var caught = null;
+                    try { await that.rollSilent('5'); } catch (e) { caught = e; }
+                    check('constant-only rejects', caught && caught.error === true);
+                }
+
+                // ── 7. Stringify roundtrip ─────────────────────────────
+                group('Stringify roundtrip');
+                {
+                    var original = '4d6dl1+5';
+                    var parsed = that.parse_notation(original);
+                    var roundtripped = that.stringify_notation(parsed);
+                    var reparsed = that.parse_notation(roundtripped);
+                    check('roundtrip parses',
+                        !reparsed.error && reparsed.groups.length === 1);
+                    check('roundtrip preserves rule count',
+                        reparsed.groups[0].rules.length === parsed.groups[0].rules.length);
+                }
+
+                // ── 8. Rule fires (statistical) ────────────────────────
+                if (!skipStatistical) {
+                    group('Rule fires (statistical, n=' + samples + ')');
+                    {
+                        var fired = 0;
+                        for (var i = 0; i < samples; i++) {
+                            var rr = await that.rollSilent('1d6!');
+                            if (rr.diceResults.length > 1) fired++;
+                        }
+                        var rate = fired / samples;
+                        check('d6! fires at ~1/6 rate',
+                            rate > 0.10 && rate < 0.25, rate.toFixed(3));
+                    }
+                    {
+                        var fired = 0;
+                        for (var i = 0; i < samples; i++) {
+                            var rr = await that.rollSilent('1d6!>3');
+                            if (rr.diceResults.length > 1) fired++;
+                        }
+                        var rate = fired / samples;
+                        check('1d6!>3 fires at ~1/2 rate',
+                            rate > 0.35 && rate < 0.65, rate.toFixed(3));
+                    }
+                    {
+                        var fired = 0;
+                        for (var i = 0; i < samples; i++) {
+                            var rr = await that.rollSilent('1d20r1');
+                            if (rr.diceResults.length > 1) fired++;
+                        }
+                        var rate = fired / samples;
+                        check('1d20r1 fires at ~1/20 rate',
+                            rate > 0.01 && rate < 0.15, rate.toFixed(3));
+                    }
+                    {
+                        var maxDice = 0;
+                        for (var i = 0; i < samples; i++) {
+                            var rr = await that.rollSilent('1d20ro1');
+                            if (rr.diceResults.length > maxDice) maxDice = rr.diceResults.length;
+                        }
+                        check('1d20ro1 never exceeds 2 dice', maxDice <= 2, maxDice);
+                    }
+                    {
+                        var lowExplosions = 0;
+                        for (var i = 0; i < samples * 2; i++) {
+                            var rr = await that.rollSilent('1d100!');
+                            var anyNine = rr.diceResults.some(function(d) { return d.value === 9; });
+                            var didExplode = rr.diceResults.length > 1;
+                            if (anyNine && !didExplode) lowExplosions++;
+                        }
+                        check('d100! does not explode on 9', lowExplosions > 0, lowExplosions);
+                    }
+                }
+
+                // ── 9. Rendered path (optional) ────────────────────────
+                var canRender = !skipRendered
+                    && typeof THREE !== 'undefined'
+                    && typeof CANNON !== 'undefined'
+                    && typeof document !== 'undefined';
+
+                if (canRender) {
+                    group('Rendered path');
+                    var container = externalContainer;
+                    if (!container) {
+                        container = document.createElement('div');
+                        container.style.cssText =
+                            'width:400px;height:400px;position:fixed;top:0;left:0;' +
+                            'opacity:0;pointer-events:none;z-index:-1;';
+                        document.body.appendChild(container);
+                        createdContainer = container;
+                    }
+                    var box = null;
+                    try {
+                        box = new that.dice_box(container);
+                        box.setDice('4d6dl1cs6');
+                        var rendered = await box.start_throw();
+                        check('rendered: has successCount', 'successCount' in rendered);
+                        check('rendered: has failureCount', 'failureCount' in rendered);
+                        check('rendered: 4 dice in diceResults',
+                            rendered.diceResults.length === 4);
+                        check('rendered: 1 dropped',
+                            rendered.diceResults.filter(function(d) { return !d.kept; }).length === 1);
+                    } catch (e) {
+                        check('rendered path ran without error', false, e && e.message);
+                    } finally {
+                        if (box) {
+                            try { box.destroy(); } catch (e) { /* ignore */ }
+                        }
+                    }
+                } else if (!skipRendered && verbose) {
+                    group('Rendered path');
+                    console.log('  (skipped \u2014 THREE, CANNON, or DOM not available)');
+                }
+            } catch (e) {
+                fail++;
+                results.push({ ok: false, name: 'test suite threw', extra: e && e.message });
+                if (verbose) {
+                    console.log('\n  \u2717 test suite threw \u2014 ' + (e && e.message));
+                }
+            } finally {
+                if (createdContainer && createdContainer.parentNode) {
+                    createdContainer.parentNode.removeChild(createdContainer);
+                }
+            }
+
+            var summary = pass + ' passed, ' + fail + ' failed';
+            if (verbose) {
+                console.log('\n' + (fail === 0 ? '\u2713' : '\u2717') + ' ' + summary);
+            }
+            return { pass: pass, fail: fail, results: results, summary: summary };
+        })();
+    };
 
     return that;
 
