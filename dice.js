@@ -4042,10 +4042,12 @@ var DICE = (function() {
                     var fullValue = values[logicalDieIndex];
                     var tens = Math.floor(fullValue / 10) % 10;
                     var unit = fullValue % 10;
+                    // shift_dice_faces takes public values: the tens die
+                    // reads 0, 10 ... 90 and the units d10 reads 0 as 10.
                     if (vec.role === 'tens') {
-                        requestedValuesPerDie.push(tens);
+                        requestedValuesPerDie.push(tens * 10);
                     } else { // units
-                        requestedValuesPerDie.push(unit);
+                        requestedValuesPerDie.push(unit === 0 ? 10 : unit);
                         // Store the forced unit on the mesh so combine_compound_results can use it later.
                         // Find the mesh for this physical die.
                         var mesh = null;
@@ -4573,7 +4575,7 @@ var DICE = (function() {
 
             // tensResult.value is the tens digit * 10 (e.g., 60 for face "60")
             var tensDigit = tensResult.value / 10; // get 0-9
-            var unitDigit = unitResult.value;      // 0-9
+            var unitDigit = unitResult.value % 10; // d10 reads its 0 face as 10
             // If forced unit is present, use it
             var mesh = comp._mesh;
             if (mesh && mesh.forced_unit !== undefined) {
@@ -6622,16 +6624,41 @@ var DICE = (function() {
     }
 
     /**
+     * Converts a public die value, as returned by get_dice_value(), back to
+     * the internal face number used by dice_face_range and the face labels.
+     *
+     *     d10   10      -> face 0
+     *     d9    9       -> face 0
+     *     d100  0..90   -> face 0..9 (tens digit)
+     *
+     * Every other type uses the same number for both.
+     *
+     * @param {string} type
+     * @param {number} value
+     * @returns {number}
+     */
+    function public_value_to_face(type, value) {
+        if (type == 'd10' && value == 10) return 0;
+        if (type == 'd9' && value == 9) return 0;
+        if (type == 'd100') return value / 10;
+        return value;
+    }
+
+    /**
      * Shifts a die's visible face labels so that the requested value becomes
      * the eventual result.
      *
      * This is used when an external caller supplies authoritative results.
-     * For compound dice, the caller provides the full combined value (1-100),
-     * and this function splits it into tens and units, shifting each die accordingly.
+     * Every label is moved by the same offset (wrapping around the die's face
+     * range), so the die still carries each number exactly once.
+     *
+     * Both values are public die values, in the same units get_dice_value()
+     * returns: 1-10 for a d10, and 0, 10 ... 90 for a d100 tens die. Compound
+     * d100 results are split into tens and units by the caller.
      *
      * @param {THREE.Mesh} dice
-     * @param {number} value - The value to shift this die to (already split for compound)
-     * @param {number} res - The current face value of this die
+     * @param {number} value - The value this die should show
+     * @param {number} res - The value this die currently lands on
      */
     function shift_dice_faces(
         dice,
@@ -6644,27 +6671,14 @@ var DICE = (function() {
                 dice.dice_type
             ];
 
-        /*
-         * Public d10 value 10 corresponds to internal face 0.
-         */
-        if (
-            dice.dice_type == 'd10' &&
-            value == 10
-        ) {
+        var size =
+            r[1] - r[0] + 1;
 
-            value = 0;
-        }
+        value =
+            public_value_to_face(dice.dice_type, value);
 
-        /*
-         * Public d9 value 9 corresponds to internal face 0.
-         */
-        if (
-            dice.dice_type == 'd9' &&
-            value == 9
-        ) {
-
-            value = 0;
-        }
+        res =
+            public_value_to_face(dice.dice_type, res);
 
         /*
          * Ignore invalid requested values.
@@ -6710,7 +6724,7 @@ var DICE = (function() {
             ) {
 
                 matindex -=
-                    r[1];
+                    size;
             }
 
             while (
@@ -6718,7 +6732,7 @@ var DICE = (function() {
             ) {
 
                 matindex +=
-                    r[1];
+                    size;
             }
 
             geom.groups[i]
