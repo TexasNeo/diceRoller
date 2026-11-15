@@ -823,15 +823,17 @@ Roll `1d20`, `4d6dl1`, `2d6!>4`, `2d20kh1!`, and dozens of other forms. Watch th
 
 ## Dependencies
 
-Load these before `dice.js`:
-
 | Library | Version | Purpose |
 |---|---|---|
 | [teal.js](https://github.com/TealStar/teal.js) | any | Small DOM utility helpers (`$t`) |
-| [three.js](https://threejs.org/) | r7x–r9x | 3D rendering |
+| [three.js](https://threejs.org/) | r187 | 3D rendering (ES module) |
 | [cannon.js](https://github.com/schteppe/cannon.js) | 0.6.x | Physics simulation |
 
-Newer versions of three.js will not work without code changes. The library uses deprecated APIs like `THREE.Geometry`, `THREE.MeshFaceMaterial`, and `THREE.Face3`, which were removed in r125.
+`dice.js` is an ES module. It does `import * as THREE from 'three'`, so the page needs an [import map](https://developer.mozilla.org/en-US/docs/Web/HTML/Element/script/type/importmap) (or a bundler) that resolves `three`. The bundled copy lives in `libs/three.module.js`, which in turn imports `libs/three.core.js`, so keep the two files together.
+
+teal.js and cannon.js are still classic scripts and must be loaded before `dice.js`. The module exports `DICE` as its default export and also sets `window.DICE`, so classic scripts that run after it (for example, on `DOMContentLoaded`) can keep using the global.
+
+Because ES modules are not loaded from `file://` URLs, serve the page over HTTP when developing (for example, `python3 -m http.server`).
 
 ---
 
@@ -852,12 +854,15 @@ Newer versions of three.js will not work without code changes. The library uses 
 <body>
     <div id="dice-tray"></div>
 
+    <script type="importmap">
+        { "imports": { "three": "./libs/three.module.js" } }
+    </script>
     <script src="teal.js"></script>
-    <script src="three.js"></script>
     <script src="cannon.js"></script>
-    <script src="dice.js"></script>
 
-    <script>
+    <script type="module">
+        import DICE from './dice.js';
+
         var tray = document.getElementById('dice-tray');
         var box = new DICE.dice_box(tray);
 
@@ -1518,7 +1523,7 @@ console.log((await visual).resultTotal);
 The silent result arrives first. The visual roll continues as normal and eventually resolves with its own result.
 
 ## Browser Support and Mobile Notes
-WebGL is strongly preferred. Without it the library falls back to THREE.CanvasRenderer, but visual quality is dramatically reduced.
+WebGL is required. three.js no longer ships a canvas fallback renderer, so browsers without WebGL cannot render the dice tray. The static `DICE.rollSilent()` does not create a renderer and still works without WebGL.
 
 The container must have a non-zero rendered size when the first roll is attempted. If you construct the dice_box before the container has laid out (common with flex/grid layouts, or if the element is added to the DOM in the same tick), rolls will fail with a RENDER_FAILED error.
 
@@ -1612,12 +1617,15 @@ callback.
 <div id="builder"></div>
 <div id="tray" style="height: 400px; position: relative;"></div>
 
+<script type="importmap">
+  { "imports": { "three": "./libs/three.module.js" } }
+</script>
 <script src="teal.js"></script>
-<script src="three.js"></script>
 <script src="cannon.js"></script>
-<script src="dice.js"></script>
 <script src="die-builder.js"></script>
-<script>
+<script type="module">
+  import DICE from './dice.js';
+
   const box = new DICE.dice_box(document.getElementById('tray'));
 
   const builder = new DieBuilder({

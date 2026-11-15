@@ -1,4 +1,4 @@
-"use strict";
+import * as THREE from 'three';
 
 /**
  * @brief Generates polyhedral dice with 3D roll animation, physics and
@@ -43,7 +43,13 @@
  * @author Rory Hibbert (refactor, see changelog)
  * @date September 2026
  * @version 3.0 (with advanced rules and audit)
- * @dependencies teal.js, cannon.js, three.js
+ * @dependencies teal.js, cannon.js, three.js (r187+, ES module)
+ *
+ * This file is an ES module. It imports three.js as the bare specifier
+ * 'three', so the page needs an import map (or a bundler) that resolves it.
+ * teal.js and cannon.js are still classic scripts and must be loaded before
+ * this module runs. The library is exported as the default export and is
+ * also published as `window.DICE` for classic-script callers.
  */
 
 /**
@@ -358,6 +364,16 @@ var DICE = (function() {
      * callers can customise the appearance and throwing behaviour without
      * coupling themselves to Three.js or Cannon.js internals.
      */
+    /**
+     * Multiplier applied to every light intensity.
+     *
+     * three.js r155+ uses physically based light units, where Lambert/Phong
+     * shading divides incoming light by PI. Multiplying by PI keeps the
+     * public intensity values (e.g. `spot_light_intensity: 2.0`) producing
+     * roughly the same brightness they did under the legacy lighting model.
+     */
+    var LIGHT_INTENSITY_SCALE = Math.PI;
+
     var vars = {
         frame_rate: 1 / 60,
         scale: 100,
@@ -366,7 +382,7 @@ var DICE = (function() {
             specular: 0x172022,
             color: 0xf0f0f0,
             shininess: 40,
-            shading: THREE.FlatShading,
+            flatShading: true,
         },
 
         label_color: '#aaaaaa',
@@ -990,15 +1006,11 @@ var DICE = (function() {
 
         this.container = container;
 
-        this.renderer = window.WebGLRenderingContext
-            ? new THREE.WebGLRenderer({
-                antialias: true,
-                alpha: true
-            })
-            : new THREE.CanvasRenderer({
-                antialias: true,
-                alpha: true
-            });
+        this.renderer = new THREE.WebGLRenderer({
+            antialias: true,
+            alpha: true
+        });
+        this.renderer.setPixelRatio(window.devicePixelRatio || 1);
 
         container.appendChild(this.renderer.domElement);
 
@@ -1037,7 +1049,8 @@ var DICE = (function() {
          * Ambient lighting.
          */
         var ambientLight = new THREE.AmbientLight(
-            vars.ambient_light_color
+            vars.ambient_light_color,
+            LIGHT_INTENSITY_SCALE
         );
         this.scene.add(ambientLight);
 
@@ -1220,7 +1233,7 @@ var DICE = (function() {
 
         this.light = new THREE.SpotLight(
             vars.spot_light_color,
-            2.0
+            (vars.spot_light_intensity || 2.0) * LIGHT_INTENSITY_SCALE
         );
         this.light.position.set(
             -mw / 2,
@@ -1233,14 +1246,14 @@ var DICE = (function() {
             0
         );
         this.light.distance = mw * 5;
+        // No physical falloff: the tray is lit evenly, as it was before
+        // three.js switched to physically based light units.
+        this.light.decay = 0;
         this.light.castShadow = true;
-        this.light.shadowCameraNear = mw / 10;
-        this.light.shadowCameraFar = mw * 5;
-        this.light.shadowCameraFov = 50;
-        this.light.shadowBias = 0.001;
-        this.light.shadowDarkness = 1.1;
-        this.light.shadowMapWidth = 1024;
-        this.light.shadowMapHeight = 1024;
+        this.light.shadow.camera.near = mw / 10;
+        this.light.shadow.camera.far = mw * 5;
+        this.light.shadow.bias = -0.0001;
+        this.light.shadow.mapSize.set(1024, 1024);
         this.scene.add(this.light);
 
         if (this.desk) {
@@ -3430,7 +3443,7 @@ var DICE = (function() {
             materials = create_dice_materials(face_labels, size, margin, materialOptions, bodyColor, labelColor);
         }
 
-        var dice = new THREE.Mesh(geometry, new THREE.MeshFaceMaterial(materials));
+        var dice = new THREE.Mesh(geometry, materials);
         dice.castShadow = true;
 
         /*
@@ -4266,7 +4279,7 @@ var DICE = (function() {
             case 'spot_light_intensity':
                 vars.spot_light_intensity = value;
                 if (instance.light) {
-                    instance.light.intensity = value;
+                    instance.light.intensity = value * LIGHT_INTENSITY_SCALE;
                 }
                 break;
             case 'desk_color':
@@ -4649,7 +4662,7 @@ var DICE = (function() {
                         }
                         materials = create_dice_materials(face_labels, size, margin, materialOptions, bodyColor, labelColor);
                     }
-                    dice.material = new THREE.MeshFaceMaterial(materials);
+                    dice.material = materials;
                     dice.dropped_visuals_applied = true;
                     droppedCount++;
                 }
@@ -4665,16 +4678,14 @@ var DICE = (function() {
         if (!mesh || !mesh.material) return;
         if (mesh._exploded) return; // already highlighted
 
-        // Get the materials array (for MeshFaceMaterial, it's under .materials)
-        var materials = Array.isArray(mesh.material) ? mesh.material : 
-                        (mesh.material.materials ? mesh.material.materials : [mesh.material]);
+        var materials = get_die_materials(mesh);
 
         for (var i = 0; i < materials.length; i++) {
             var mat = materials[i];
             if (!mat) continue;
             // Do NOT change the base colour – keep the original texture.
             // Instead, add a warm emissive glow.
-            mat.emissive = new THREE.Color(0xff8800); // orange-gold
+            mat.emissive.setHex(0xff8800); // orange-gold
             mat.emissiveIntensity = 0.1;              // subtle glow
             // Slightly increase shininess for a more “excited” look
             mat.shininess = 40;
@@ -4712,14 +4723,13 @@ var DICE = (function() {
         if (!mesh || !mesh.material) return;
         if (mesh._criticalHighlighted) return;
 
-        var materials = Array.isArray(mesh.material) ? mesh.material :
-                        (mesh.material.materials ? mesh.material.materials : [mesh.material]);
+        var materials = get_die_materials(mesh);
         var color = isFailure ? 0x990000 : 0x006622;
 
         for (var i = 0; i < materials.length; i++) {
             var mat = materials[i];
             if (!mat) continue;
-            mat.emissive = new THREE.Color(color);
+            mat.emissive.setHex(color);
             mat.emissiveIntensity = 0.18;
         }
         mesh._criticalHighlighted = true;
@@ -4778,7 +4788,7 @@ var DICE = (function() {
      * the same type in every roll.
      *
      * The cache stores one geometry per type, not per die instance, so all
-     * d20s in a roll share a single `THREE.Geometry` object. Materials are
+     * d20s in a roll share a single `THREE.BufferGeometry` object. Materials are
      * NOT shared in the same way — each die gets its own materials so that
      * per-die features (dropped-dice greying, critical highlights, fade-out
      * opacity) can vary independently.
@@ -4819,7 +4829,7 @@ var DICE = (function() {
      * container, while dice already in the scene retain the old ones.
      *
      * @param {string} type - Die type, e.g. 'd4', 'd6', 'd20', 'd100'.
-     * @returns {THREE.Geometry|null} The cached (or newly created) geometry,
+     * @returns {THREE.BufferGeometry|null} The cached (or newly created) geometry,
      *          or null if the type is not recognised. Callers must handle the
      *          null case; create_dice logs a warning and skips the die.
      */
@@ -4883,12 +4893,10 @@ var DICE = (function() {
         if (!this.d4_material) {
 
             this.d4_material =
-                new THREE.MeshFaceMaterial(
-                    create_d4_materials(
-                        vars.scale / 2,
-                        vars.scale * 2,
-                        CONSTS.d4_labels[0]
-                    )
+                create_d4_materials(
+                    vars.scale / 2,
+                    vars.scale * 2,
+                    CONSTS.d4_labels[0]
                 );
         }
 
@@ -4916,12 +4924,10 @@ var DICE = (function() {
         if (!this.dice_material) {
 
             this.dice_material =
-                new THREE.MeshFaceMaterial(
-                    create_dice_materials(
-                        CONSTS.standart_d20_dice_face_labels,
-                        vars.scale / 2,
-                        0.9
-                    )
+                create_dice_materials(
+                    CONSTS.standart_d20_dice_face_labels,
+                    vars.scale / 2,
+                    0.9
                 );
         }
 
@@ -4949,12 +4955,10 @@ var DICE = (function() {
         if (!this.dice_material) {
 
             this.dice_material =
-                new THREE.MeshFaceMaterial(
-                    create_dice_materials(
-                        CONSTS.standart_d20_dice_face_labels,
-                        vars.scale / 2,
-                        1.4
-                    )
+                create_dice_materials(
+                    CONSTS.standart_d20_dice_face_labels,
+                    vars.scale / 2,
+                    1.4
                 );
         }
 
@@ -4982,12 +4986,10 @@ var DICE = (function() {
         if (!this.dice_material) {
 
             this.dice_material =
-                new THREE.MeshFaceMaterial(
-                    create_dice_materials(
-                        CONSTS.standart_d20_dice_face_labels,
-                        vars.scale / 2,
-                        1.0
-                    )
+                create_dice_materials(
+                    CONSTS.standart_d20_dice_face_labels,
+                    vars.scale / 2,
+                    1.0
                 );
         }
 
@@ -5015,12 +5017,10 @@ var DICE = (function() {
         if (!this.dice_material) {
 
             this.dice_material =
-                new THREE.MeshFaceMaterial(
-                    create_dice_materials(
-                        CONSTS.standart_d20_dice_face_labels,
-                        vars.scale / 2,
-                        1.0
-                    )
+                create_dice_materials(
+                    CONSTS.standart_d20_dice_face_labels,
+                    vars.scale / 2,
+                    1.0
                 );
         }
 
@@ -5048,12 +5048,10 @@ var DICE = (function() {
         if (!this.dice_material) {
 
             this.dice_material =
-                new THREE.MeshFaceMaterial(
-                    create_dice_materials(
-                        CONSTS.standart_d20_dice_face_labels,
-                        vars.scale / 2,
-                        1.0
-                    )
+                create_dice_materials(
+                    CONSTS.standart_d20_dice_face_labels,
+                    vars.scale / 2,
+                    1.0
                 );
         }
 
@@ -5081,12 +5079,10 @@ var DICE = (function() {
         if (!this.dice_material) {
 
             this.dice_material =
-                new THREE.MeshFaceMaterial(
-                    create_dice_materials(
-                        CONSTS.standart_d20_dice_face_labels,
-                        vars.scale / 2,
-                        1.2
-                    )
+                create_dice_materials(
+                    CONSTS.standart_d20_dice_face_labels,
+                    vars.scale / 2,
+                    1.2
                 );
         }
 
@@ -5114,12 +5110,10 @@ var DICE = (function() {
         if (!this.d100_material) {
 
             this.d100_material =
-                new THREE.MeshFaceMaterial(
-                    create_dice_materials(
-                        CONSTS.standart_d100_dice_face_labels,
-                        vars.scale / 2,
-                        1.5
-                    )
+                create_dice_materials(
+                    CONSTS.standart_d100_dice_face_labels,
+                    vars.scale / 2,
+                    1.5
                 );
         }
 
@@ -5235,12 +5229,12 @@ var DICE = (function() {
             }
 
             var texture =
-                new THREE.Texture(
+                new THREE.CanvasTexture(
                     canvas
                 );
 
-            texture.needsUpdate =
-                true;
+            texture.colorSpace =
+                THREE.SRGBColorSpace;
 
             return texture;
         }
@@ -5378,12 +5372,12 @@ var DICE = (function() {
             }
 
             var texture =
-                new THREE.Texture(
+                new THREE.CanvasTexture(
                     canvas
                 );
 
-            texture.needsUpdate =
-                true;
+            texture.colorSpace =
+                THREE.SRGBColorSpace;
 
             return texture;
         }
@@ -5422,7 +5416,7 @@ var DICE = (function() {
      * Creates d4 geometry.
      *
      * @param {number} radius
-     * @returns {THREE.Geometry}
+     * @returns {THREE.BufferGeometry}
      */
     function create_d4_geometry(radius) {
 
@@ -5454,7 +5448,7 @@ var DICE = (function() {
      * Creates d6 geometry.
      *
      * @param {number} radius
-     * @returns {THREE.Geometry}
+     * @returns {THREE.BufferGeometry}
      */
     function create_d6_geometry(radius) {
 
@@ -5492,7 +5486,7 @@ var DICE = (function() {
      * Creates d8 geometry.
      *
      * @param {number} radius
-     * @returns {THREE.Geometry}
+     * @returns {THREE.BufferGeometry}
      */
     function create_d8_geometry(radius) {
 
@@ -5530,7 +5524,7 @@ var DICE = (function() {
      * Creates d10 geometry.
      *
      * @param {number} radius
-     * @returns {THREE.Geometry}
+     * @returns {THREE.BufferGeometry}
      */
     function create_d10_geometry(radius) {
 
@@ -5611,7 +5605,7 @@ var DICE = (function() {
      * Creates d12 geometry.
      *
      * @param {number} radius
-     * @returns {THREE.Geometry}
+     * @returns {THREE.BufferGeometry}
      */
     function create_d12_geometry(radius) {
 
@@ -5673,7 +5667,7 @@ var DICE = (function() {
      * Creates d20 geometry.
      *
      * @param {number} radius
-     * @returns {THREE.Geometry}
+     * @returns {THREE.BufferGeometry}
      */
     function create_d20_geometry(radius) {
 
@@ -5749,11 +5743,9 @@ var DICE = (function() {
     /**
      * Extracts the array of materials attached to a die mesh.
      *
-     * Three.js uses two different material shapes depending on how a mesh was
-     * built. A plain material is a single object; a MeshFaceMaterial wraps an
-     * array under `.materials`, one entry per face group. Both shapes appear
-     * in the codebase — the animated pipeline uses MeshFaceMaterial, but a
-     * caller-provided mesh could use either.
+     * Three.js meshes carry either a single material or an array of
+     * materials, one entry per geometry group. The animated pipeline uses
+     * arrays, but a caller-provided mesh could use either.
      *
      * The fade-out system and the dropped-die visual swap both need to iterate
      * materials and set opacity on each one. Rather than duplicating the shape
@@ -5772,7 +5764,6 @@ var DICE = (function() {
     function get_die_materials(dice) {
         if (!dice || !dice.material) return [];
         if (Array.isArray(dice.material)) return dice.material;
-        if (dice.material.materials) return dice.material.materials;
         return [dice.material];
     }
 
@@ -5894,12 +5885,23 @@ var DICE = (function() {
     /**
      * Creates a Three.js geometry from the supplied polyhedron definition.
      *
-     * @param {Array[]} vertices
+     * The result is a non-indexed BufferGeometry. Each polygon face is
+     * fanned into triangles, and each numbered face gets its own draw group
+     * whose `materialIndex` selects the face label (index 0 is the blank
+     * material used by chamfer edges and corners, which share one group).
+     *
+     * Group order matches the order faces are generated in, and
+     * `geom.userData.faceNormals[g]` holds the outward normal of group `g`
+     * (null for the blank group). get_dice_value() uses these normals to
+     * read the result, and shift_dice_faces() relabels a die by rewriting
+     * group material indices on a clone.
+     *
+     * @param {THREE.Vector3[]} vertices
      * @param {Array[]} faces
      * @param {number} radius
      * @param {number} tab
      * @param {number} af
-     * @returns {THREE.Geometry}
+     * @returns {THREE.BufferGeometry}
      */
     function make_geom(
         vertices,
@@ -5909,137 +5911,92 @@ var DICE = (function() {
         af
     ) {
 
-        var geom =
-            new THREE.Geometry();
+        var geom = new THREE.BufferGeometry();
+        var positions = [];
+        var uvs = [];
+        var faceNormals = [];
 
-        for (
-            var i = 0;
-            i < vertices.length;
-            ++i
-        ) {
-
-            var vertex =
-                vertices[i]
-                    .multiplyScalar(
-                        radius
-                    );
-
-            vertex.index =
-                geom.vertices.push(
-                    vertex
-                ) - 1;
+        for (var i = 0; i < vertices.length; ++i) {
+            vertices[i].multiplyScalar(radius);
         }
 
-        for (
-            var i = 0;
-            i < faces.length;
-            ++i
-        ) {
+        function push_uv(angle) {
+            uvs.push(
+                (Math.cos(angle) + 1 + tab) / 2 / (1 + tab),
+                (Math.sin(angle) + 1 + tab) / 2 / (1 + tab)
+            );
+        }
 
-            var ii =
-                faces[i];
+        var triangleCount = 0;
+        var lastGroup = null;
 
-            var fl =
-                ii.length - 1;
+        for (var i = 0; i < faces.length; ++i) {
 
-            var aa =
-                Math.PI * 2 / fl;
+            var ii = faces[i];
+            var fl = ii.length - 1;
+            var aa = Math.PI * 2 / fl;
+            var matindex = ii[fl] + 1;
+            var start = triangleCount * 3;
 
-            for (
-                var j = 0;
-                j < fl - 2;
-                ++j
-            ) {
+            for (var j = 0; j < fl - 2; ++j) {
 
-                geom.faces.push(
-                    new THREE.Face3(
-                        ii[0],
-                        ii[j + 1],
-                        ii[j + 2],
+                var a = vertices[ii[0]];
+                var b = vertices[ii[j + 1]];
+                var c = vertices[ii[j + 2]];
 
-                        [
-                            geom.vertices[ii[0]],
-                            geom.vertices[ii[j + 1]],
-                            geom.vertices[ii[j + 2]]
-                        ],
-
-                        0,
-
-                        ii[fl] + 1
-                    )
+                positions.push(
+                    a.x, a.y, a.z,
+                    b.x, b.y, b.z,
+                    c.x, c.y, c.z
                 );
 
-                geom.faceVertexUvs[0].push([
-                    new THREE.Vector2(
-                        (
-                            Math.cos(af) +
-                            1 +
-                            tab
-                        ) /
-                        2 /
-                        (1 + tab),
+                push_uv(af);
+                push_uv(aa * (j + 1) + af);
+                push_uv(aa * (j + 2) + af);
 
-                        (
-                            Math.sin(af) +
-                            1 +
-                            tab
-                        ) /
-                        2 /
-                        (1 + tab)
-                    ),
-
-                    new THREE.Vector2(
-                        (
-                            Math.cos(
-                                aa * (j + 1) +
-                                af
-                            ) +
-                            1 +
-                            tab
-                        ) /
-                        2 /
-                        (1 + tab),
-
-                        (
-                            Math.sin(
-                                aa * (j + 1) +
-                                af
-                            ) +
-                            1 +
-                            tab
-                        ) /
-                        2 /
-                        (1 + tab)
-                    ),
-
-                    new THREE.Vector2(
-                        (
-                            Math.cos(
-                                aa * (j + 2) +
-                                af
-                            ) +
-                            1 +
-                            tab
-                        ) /
-                        2 /
-                        (1 + tab),
-
-                        (
-                            Math.sin(
-                                aa * (j + 2) +
-                                af
-                            ) +
-                            1 +
-                            tab
-                        ) /
-                        2 /
-                        (1 + tab)
-                    )
-                ]);
+                ++triangleCount;
             }
+
+            var count = triangleCount * 3 - start;
+
+            // Blank faces never need individual normals or relabelling, so
+            // consecutive ones are merged into a single draw group.
+            if (matindex == 0 && lastGroup && lastGroup.materialIndex == 0) {
+                lastGroup.count += count;
+                continue;
+            }
+
+            geom.addGroup(start, count, matindex);
+            lastGroup = geom.groups[geom.groups.length - 1];
+
+            faceNormals.push(
+                matindex == 0
+                    ? null
+                    : new THREE.Vector3()
+                        .subVectors(vertices[ii[1]], vertices[ii[0]])
+                        .cross(
+                            new THREE.Vector3().subVectors(
+                                vertices[ii[2]],
+                                vertices[ii[0]]
+                            )
+                        )
+                        .normalize()
+            );
         }
 
-        geom.computeFaceNormals();
+        geom.setAttribute(
+            'position',
+            new THREE.Float32BufferAttribute(positions, 3)
+        );
+        geom.setAttribute(
+            'uv',
+            new THREE.Float32BufferAttribute(uvs, 2)
+        );
+
+        // Non-indexed geometry, so this yields flat per-face normals.
+        geom.computeVertexNormals();
+
+        geom.userData.faceNormals = faceNormals;
 
         geom.boundingSphere =
             new THREE.Sphere(
@@ -6384,7 +6341,7 @@ var DICE = (function() {
      * @param {number} tab
      * @param {number} af
      * @param {number} chamfer
-     * @returns {THREE.Geometry}
+     * @returns {THREE.BufferGeometry}
      */
     function create_geom(
         vertices,
@@ -6522,15 +6479,18 @@ var DICE = (function() {
         var closest_angle =
             Math.PI * 2;
 
+        var groups = dice.geometry.groups;
+        var normals = dice.geometry.userData.faceNormals;
+
         for (
             var i = 0,
-            l = dice.geometry.faces.length;
+            l = groups.length;
             i < l;
             ++i
         ) {
 
             var face =
-                dice.geometry.faces[i];
+                groups[i];
 
             /*
              * Material zero is the blank/internal material and is not a
@@ -6543,7 +6503,7 @@ var DICE = (function() {
             }
 
             var angle =
-                face.normal
+                normals[i]
                     .clone()
                     .applyQuaternion(
                         dice.body.quaternion
@@ -6727,13 +6687,13 @@ var DICE = (function() {
 
         for (
             var i = 0,
-            l = geom.faces.length;
+            l = geom.groups.length;
             i < l;
             ++i
         ) {
 
             var matindex =
-                geom.faces[i]
+                geom.groups[i]
                     .materialIndex;
 
             if (
@@ -6761,7 +6721,7 @@ var DICE = (function() {
                     r[1];
             }
 
-            geom.faces[i]
+            geom.groups[i]
                 .materialIndex =
                     matindex + 1;
         }
@@ -6781,14 +6741,12 @@ var DICE = (function() {
 
             var materialOptions = $t.copyto(vars.material_options, { color: 0xffffff });
             dice.material =
-                new THREE.MeshFaceMaterial(
-                    create_d4_materials(
-                        vars.scale / 2,
-                        vars.scale * 2,
-                        CONSTS.d4_labels[num],
-                        materialOptions,
-                        dice.body_color
-                    )
+                create_d4_materials(
+                    vars.scale / 2,
+                    vars.scale * 2,
+                    CONSTS.d4_labels[num],
+                    materialOptions,
+                    dice.body_color
                 );
         }
 
@@ -7144,3 +7102,7 @@ var DICE = (function() {
     return that;
 
 }());
+
+window.DICE = DICE;
+
+export default DICE;
