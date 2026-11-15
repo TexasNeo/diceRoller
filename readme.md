@@ -46,6 +46,7 @@ builder.setConfig({
 - [Dice Roller (DICE.js)](#-dice-roller-dicejs)
     - [Features](#features)
     - [Dependencies](#dependencies)
+    - [Upgrading from the three.js r73 build](#upgrading-from-the-threejs-r73-build)
     - [Quick start](#quick-start)
     - [Dice notation reference](#dice-notation-reference)
     - [API reference](#api-reference)
@@ -837,6 +838,75 @@ Because ES modules are not loaded from `file://` URLs, serve the page over HTTP 
 
 ---
 
+## Upgrading from the three.js r73 build
+
+**This is a breaking change for existing pages.** Earlier versions of `dice.js` (and `dice.min.js`) were classic scripts that used the global `THREE` from the bundled r73 `three.min.js`. They now target three.js r187, which only ships as ES modules, so `dice.js` and `dice.min.js` are ES modules too. A page that loads them with a plain `<script src>` tag will fail with `Cannot use import statement outside a module`.
+
+### What to change in your page
+
+Before:
+
+```html
+<script src="libs/three.min.js"></script>
+<script src="libs/cannon.min.js"></script>
+<script src="libs/teal.js"></script>
+<script src="dice.min.js"></script>
+<script>
+    var box = new DICE.dice_box(document.getElementById('dice-tray'));
+    box.setDice('1d20');
+    box.roll();
+</script>
+```
+
+After:
+
+```html
+<!-- 1. Tell the browser where 'three' lives (must come before any module script) -->
+<script type="importmap">
+    { "imports": { "three": "./libs/three.module.js" } }
+</script>
+
+<!-- 2. teal.js and cannon.js are unchanged and stay classic scripts -->
+<script src="libs/cannon.min.js"></script>
+<script src="libs/teal.js"></script>
+
+<!-- 3. Load DICE as a module and use it from module code -->
+<script type="module">
+    import DICE from './dice.min.js';
+
+    var box = new DICE.dice_box(document.getElementById('dice-tray'));
+    box.setDice('1d20');
+    box.roll();
+</script>
+```
+
+Step by step:
+
+1. **Replace `libs/three.min.js` with `libs/three.module.js` and `libs/three.core.js`.** Copy both files; `three.module.js` imports `three.core.js` from the same folder.
+2. **Add the import map** before any `type="module"` script. Adjust the path if your files live elsewhere.
+3. **Load `dice.js` / `dice.min.js` with `type="module"`.** Either `import DICE from './dice.min.js'` inside a module script, as above, or keep a `<script type="module" src="dice.min.js">` tag and use the `window.DICE` global it sets.
+4. **Don't use `DICE` from a classic inline script that runs straight away.** Module scripts run after the page has been parsed, so a classic `<script>` placed after the tag runs first and sees `DICE` as undefined. Move that code into a module script, or run it on `DOMContentLoaded`, which fires after modules have run:
+
+   ```html
+   <script type="module" src="dice.min.js"></script>
+   <script>
+       document.addEventListener('DOMContentLoaded', function() {
+           var box = new DICE.dice_box(document.getElementById('dice-tray'));
+       });
+   </script>
+   ```
+
+5. **Serve the page over HTTP.** Browsers block ES modules on `file://` URLs.
+
+### Other behaviour changes
+
+- **WebGL is required.** The `CanvasRenderer` fallback no longer exists in three.js.
+- **If your code reaches into the meshes:** die materials are now a plain array (`mesh.material`), not a `MeshFaceMaterial` with `.materials`, and die geometry is a `BufferGeometry` with one draw group per face instead of a `Geometry` with `.faces`.
+- **If your page uses three.js itself,** it now needs to use r187 (or a compatible version) through the same import map; the global `THREE` is gone.
+- **d100 totals when the units die shows 0** now match the dice: 30 + 0 is reported as 30 (previously 40), and 00 + 0 as 100 (previously 10).
+
+---
+
 ## Quick start
 
 ```html
@@ -1071,6 +1141,33 @@ box.setOnExplosion(function(info) {
 });
 ```
 ____
+### `box.setOnCollide(callback)`
+*Added to this fork to restore some of the original author's collision-sound hook point — see scope note below.*
+
+Registers a callback fired whenever a physical die collides with the desk, a barrier, or another die. No sound/haptics are built in — this hook exists purely so you can trigger your own effects (e.g. a "clack" sound, scaled by impact speed) without reaching into the physics internals.
+
+Fires on every narrowphase contact for as long as two bodies stay touching, including dice at rest, so filter on `impactSpeed` to ignore negligible resting jitter.
+
+**Scope note:** this is a deliberately minimal, raw primitive, not a polished audio feature in keeping with the rest of this fork's "comprehensive refactor" — specifically:
+- `impactSpeed` is just `body.velocity.norm()` sampled when the event fires, not a true relative-velocity-along-contact-normal calculation (this cannon.js build doesn't expose `getImpactVelocityAlongNormal()`), so it's an approximation of "how hard" a collision was, not a physically rigorous one.
+- No built-in debounce/threshold — the caller must filter `impactSpeed` themselves to avoid firing on every tick of resting/jittering contact.
+- No distinction by die type/material for pitch/tone, no spatial/stereo positioning, and no bundled audio asset or player at all — just the bare event.
+
+Treat it as a starting point for host applications to build their own sound layer on, not as equivalent sound support to what the original (pre-fork) library had.
+```js
+box.setOnCollide(function(info) {
+    if (info.impactSpeed < 80) {
+        return; // too soft to bother with
+    }
+    // info.die — the THREE.Mesh of the die that collided (.dice_type, .dice_id)
+    // info.with — the other CANNON.RigidBody (desk/barrier have no back-reference;
+    //             another die's body has .isDie === true and .die -> its THREE.Mesh)
+    // info.impactSpeed — linear velocity magnitude at the moment of collision
+    //                     (physics units, not m/s - tune your own threshold/volume curve)
+    playClackSound(Math.min(1, info.impactSpeed / 400));
+});
+```
+____
 ### `box.setParam(name, value)`
 Changes a single configuration parameter at runtime. Throws if the parameter is unknown or the value is out of range.
 ```js
@@ -1079,6 +1176,8 @@ box.setParam('fade_delay_ms', 5000);
 box.setParam('gravity_z', -4000);
 box.setParam('rng_seed', 12345);
 box.setParam('rng_seed', null);  // revert to Math.random()
+box.setParam('face_texture_image', '/path/to/marble.jpg');
+box.setParam('face_texture_image', null);  // back to flat dice_color
 ```
 See [Configuration reference](#configuration-reference) for the full list.
 ___
@@ -1202,7 +1301,9 @@ Every parameter below can be read with box.getParam(), written with box.setParam
 |`desk_color`|	color|	—|	#101010|	Desk surface colour|
 |`desk_opacity`|	number|	0–1|0.5|	Desk opacity (0 = invisible)|
 |`use_shadows`|	boolean|	—|	true|	Enable shadow rendering|
-|`dice_color`|	color|	—|	#202020|	Default die body colour|
+|`dice_color`|	color|	—|	#202020|	Default die body colour - only visible when `use_preset_colours` is `false` (see below)|
+|`use_preset_colours`|	boolean|	—|	true|	When `true` (default), each dice group cycles through the built-in preset colour palette by group index, same as always. Set `false` to make every die use `dice_color` instead - a per-group `visual.color` on the notation (if you're building notations with one) still wins over either.|
+|`face_texture_image`|	string \| null|	—|	null|	URL of an image to draw as the background of every die face, behind the number label, instead of a flat `dice_color` fill (`dice_color`/`use_preset_colours` are ignored while a texture is set - only the number's `label_color` still applies). The image is fetched and cached the moment you call `setParam` - loading is async but die creation isn't, so a die created before the fetch finishes just falls back to the flat fill for that one die; set null to go back to flat colours.|
 |`label_color`|	color|	—|	#aaaaaa|	Default face label colour|
 |`dropped_dice_color`|	color|—|	#4d4d4d|	Body colour for dropped dice|
 |`dropped_dice_label_color`|	color|	—|	#1a1a1a|	Label colour for dropped dice|

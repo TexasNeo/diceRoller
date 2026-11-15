@@ -387,6 +387,8 @@ var DICE = (function() {
 
         label_color: '#aaaaaa',
         dice_color: '#202020',
+        use_preset_colours: true,
+        face_texture_image: null,
         dropped_dice_color: '#4d4d4d',
         dropped_dice_label_color: '#1a1a1a',
 
@@ -628,6 +630,8 @@ var DICE = (function() {
     desk_opacity: { type: 'number', min: 0, max: 1, default: 0.5, description: 'Desk opacity' },
     use_shadows: { type: 'boolean', default: true, description: 'Enable shadows' },
     dice_color: { type: 'color', default: '#202020', description: 'Default die body colour' },
+    use_preset_colours: { type: 'boolean', default: true, description: 'Cycle each dice group through the built-in preset colour palette instead of using a single dice_color for every die' },
+    face_texture_image: { type: 'string', default: null, nullable: true, description: 'URL of an image to draw as the background of every die face, behind the number label, instead of a flat dice_color fill. The image is fetched and cached the moment this is set; if it has not finished loading yet by the time a die is created, that die falls back to the flat fill until the next one is created. null (default) disables texturing.' },
     label_color: { type: 'color', default: '#aaaaaa', description: 'Default label colour' },
     dropped_dice_color: { type: 'color', default: '#4d4d4d', description: 'Dropped die colour' },
     dropped_dice_label_color: { type: 'color', default: '#1a1a1a', description: 'Dropped die label colour' },
@@ -679,6 +683,8 @@ var DICE = (function() {
             desk_opacity: () => vars.desk_opacity,
             use_shadows: () => vars.use_shadows,
             dice_color: () => `#${vars.dice_color.toString(16).padStart(6, '0')}`,
+            use_preset_colours: () => vars.use_preset_colours,
+            face_texture_image: () => vars.face_texture_image,
             label_color: () => vars.label_color,
             dropped_dice_color: () => vars.dropped_dice_color,
             dropped_dice_label_color: () => vars.dropped_dice_label_color,
@@ -1163,6 +1169,7 @@ var DICE = (function() {
         );
 
         this._onExplosion = null;
+        this._onCollide = null;
     };
 
     /**
@@ -1351,6 +1358,31 @@ var DICE = (function() {
      */
     that.dice_box.prototype.setOnExplosion = function(callBackFunction) {
         this._onExplosion = callBackFunction;
+    };
+
+    /**
+     * Sets the function to be called whenever a physical die collides with
+     * the desk, a barrier, or another die.
+     *
+     * No sound/haptics are built in (see readme) - this hook exists purely so
+     * host applications can trigger their own effects (e.g. a "clack" sound,
+     * scaled by impactSpeed) without reaching into the physics internals.
+     *
+     * Fires on every narrowphase contact for as long as two bodies stay in
+     * contact, including dice at rest - filter on impactSpeed to ignore
+     * negligible resting jitter.
+     *
+     * @param {function} callBackFunction
+     *        Receives { die, with, impactSpeed }:
+     *        - die: the THREE.Mesh of the die that collided (has .dice_type, .dice_id)
+     *        - with: the other CANNON.RigidBody involved (desk/barrier bodies
+     *          have no back-reference; another die's body has .isDie === true
+     *          and .die pointing at its THREE.Mesh)
+     *        - impactSpeed: the die's linear velocity magnitude at the moment
+     *          of collision (physics units, not m/s - scale/threshold to taste)
+     */
+    that.dice_box.prototype.setOnCollide = function(callBackFunction) {
+        this._onCollide = callBackFunction;
     };
 
     /**
@@ -3263,8 +3295,10 @@ var DICE = (function() {
             var colorId = group.originalGroupId !== undefined ? group.originalGroupId : group.id;
             if (group.visual && group.visual.color !== undefined) {
                 groupColor = group.visual.color;
-            } else {
+            } else if (vars.use_preset_colours) {
                 groupColor = vars.preset_colours[colorId % vars.preset_colours.length];
+            } else {
+                groupColor = vars.dice_color;
             }
 
             // Whether this group is compound (e.g., d100 with units)
@@ -3503,6 +3537,22 @@ var DICE = (function() {
 
         dice.body.linearDamping = 0.1;
         dice.body.angularDamping = 0.1;
+
+        dice.body.isDie = true;
+        dice.body.die = dice;
+
+        var box = this;
+        dice.body.addEventListener('collide', function(event) {
+            if (!box._onCollide) {
+                return;
+            }
+
+            box._onCollide({
+                die: dice,
+                with: event.with,
+                impactSpeed: dice.body.velocity.norm()
+            });
+        });
 
         this.scene.add(dice);
         this.dices.push(dice);
@@ -4197,6 +4247,11 @@ var DICE = (function() {
             if (parsed < def.min || parsed > def.max) {
                 throw new Error(`Value must be between ${def.min} and ${def.max}`);
             }
+        } else if (def.type === 'string') {
+            if (typeof value !== 'string') {
+                throw new Error(`Expected a string, got "${value}"`);
+            }
+            parsed = value;
         } else if (def.type === 'color') {
             // Accept both hex strings and numbers
             if (typeof value === 'string' && value.startsWith('#')) {
@@ -4308,6 +4363,15 @@ var DICE = (function() {
                 break;
             case 'dice_color':
                 vars.dice_color = colorToNumber(value);
+                break;
+            case 'use_preset_colours':
+                vars.use_preset_colours = value;
+                break;
+            case 'face_texture_image':
+                vars.face_texture_image = value;
+                if (value) {
+                    preload_face_texture_image(value);
+                }
                 break;
             case 'label_color':
                 vars.label_color = value;
@@ -5189,15 +5253,30 @@ var DICE = (function() {
                 (1 + 2 * margin) +
                 "pt Arial";
 
-            context.fillStyle =
-                back_color;
+            var faceImage =
+                get_face_texture_image(
+                    vars.face_texture_image
+                );
 
-            context.fillRect(
-                0,
-                0,
-                canvas.width,
-                canvas.height
-            );
+            if (faceImage) {
+                context.drawImage(
+                    faceImage,
+                    0,
+                    0,
+                    canvas.width,
+                    canvas.height
+                );
+            } else {
+                context.fillStyle =
+                    back_color;
+
+                context.fillRect(
+                    0,
+                    0,
+                    canvas.width,
+                    canvas.height
+                );
+            }
 
             context.textAlign =
                 "center";
@@ -5330,15 +5409,30 @@ var DICE = (function() {
                 0.5 +
                 "pt Arial";
 
-            context.fillStyle =
-                back_color;
+            var faceImage =
+                get_face_texture_image(
+                    vars.face_texture_image
+                );
 
-            context.fillRect(
-                0,
-                0,
-                canvas.width,
-                canvas.height
-            );
+            if (faceImage) {
+                context.drawImage(
+                    faceImage,
+                    0,
+                    0,
+                    canvas.width,
+                    canvas.height
+                );
+            } else {
+                context.fillStyle =
+                    back_color;
+
+                context.fillRect(
+                    0,
+                    0,
+                    canvas.width,
+                    canvas.height
+                );
+            }
 
             context.textAlign =
                 "center";
@@ -5796,6 +5890,50 @@ var DICE = (function() {
             return '#' + ('000000' + color.toString(16)).slice(-6);
         }
         return color;
+    }
+
+    /**
+     * Cache of face_texture_image URLs to their loaded (or still-loading) Image, keyed by URL so
+     * switching back and forth between a couple of textures doesn't re-fetch each time.
+     *
+     * Image loading is asynchronous but die creation is not - it happens synchronously mid-roll (see
+     * create_dice) - so this never blocks. preload_face_texture_image kicks the fetch off the moment
+     * setParam('face_texture_image', url) is called; get_face_texture_image (used by
+     * create_dice_materials/create_d4_materials below) returns the Image only once it has actually
+     * finished loading, null otherwise, in which case that one die's faces fall back to the flat
+     * dice_color fill - the very next die created after the image finishes loading (typically still
+     * within the same roll, let alone a later one) picks it up normally.
+     */
+    var face_texture_cache = {};
+
+    function preload_face_texture_image(url) {
+        if (face_texture_cache[url]) {
+            return;
+        }
+
+        var image = new Image();
+        var entry = { image: image, loaded: false };
+        face_texture_cache[url] = entry;
+
+        image.onload = function () {
+            entry.loaded = true;
+        };
+        image.onerror = function () {
+            console.error('Dice Roll: failed to load face_texture_image:', url);
+        };
+
+        image.crossOrigin = 'anonymous';
+        image.src = url;
+    }
+
+    function get_face_texture_image(url) {
+        if (!url) {
+            return null;
+        }
+
+        var entry = face_texture_cache[url];
+
+        return (entry && entry.loaded) ? entry.image : null;
     }
 
     /**
